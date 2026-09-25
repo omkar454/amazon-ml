@@ -63,7 +63,7 @@ def generate_3gram_tfidf_candidates(
     df_targets: pd.DataFrame,
     top_n_tfidf: int = 15,
     min_similarity: float = 0.22,
-    batch_size: int = 10000
+    batch_size: int = 200
 ) -> Dict[str, List[Tuple[str, float]]]:
     """
     Computes Top-N character 3-gram cosine similarity matches between S1 and Targets.
@@ -105,24 +105,29 @@ def generate_3gram_tfidf_candidates(
         # Batch dot product: (batch_size x num_targets)
         sim_matrix = X_s1_batch.dot(X_targets_T)
         
-        for row_idx in range(sim_matrix.shape[0]):
+        indptr = sim_matrix.indptr
+        indices = sim_matrix.indices
+        data = sim_matrix.data
+        
+        for row_idx in range(end_i - start_i):
             global_s1_idx = start_i + row_idx
             s1_id = s1_ids[global_s1_idx]
             
-            row = sim_matrix.getrow(row_idx)
-            if row.nnz == 0:
+            row_start = indptr[row_idx]
+            row_end = indptr[row_idx + 1]
+            if row_start == row_end:
                 continue
                 
-            cols = row.indices
-            data = row.data
+            cols = indices[row_start:row_end]
+            row_data = data[row_start:row_end]
             
             # Filter by minimum similarity
-            valid_mask = data >= min_similarity
+            valid_mask = row_data >= min_similarity
             if not np.any(valid_mask):
                 continue
                 
             valid_cols = cols[valid_mask]
-            valid_data = data[valid_mask]
+            valid_data = row_data[valid_mask]
             
             # Select top-N
             if len(valid_data) > top_n_tfidf:
@@ -137,6 +142,11 @@ def generate_3gram_tfidf_candidates(
                 
             for col, score in zip(sel_cols, sel_scores):
                 candidates_tfidf[s1_id].append((target_ids[col], float(score)))
+                
+        if (b_idx + 1) % 50 == 0 or (b_idx + 1) == num_batches:
+            processed = end_i
+            cur_elapsed = time.time() - t0
+            print(f"      [TF-IDF] Processed {processed:,}/{len(df_s1):,} ({processed/len(df_s1)*100:.1f}%) in {cur_elapsed:.1f}s...")
                 
     elapsed = time.time() - t0
     print(f"    [Signal A: TF-IDF] Complete in {elapsed:.2f}s ({len(df_s1)/elapsed:,.0f} queries/sec). Anchors with candidates: {len(candidates_tfidf):,}")
