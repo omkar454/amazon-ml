@@ -1,0 +1,52 @@
+# Large Dataset Folders (Over 2.5GB raw + normalized files)
+**/dataset/
+dataset/
+**/dataset/train/
+**/dataset/test/
+**/dataset/normalized/
+
+# Large Output Submissions & Archives
+*.zip
+*.tar.gz
+**/output/candidate_pairs.tsv
+**/output/matching_results.tsv
+
+# Python Bytecode and Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+__MACOSX/
+Thumbs.db
