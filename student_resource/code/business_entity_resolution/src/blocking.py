@@ -58,15 +58,23 @@ def country_partition(df_s1: pd.DataFrame, df_targets: pd.DataFrame) -> Dict[str
 # 2. SIGNAL A: CHARACTER 3-GRAM TF-IDF COSINE RETRIEVAL
 # ==============================================================================
 
+try:
+    from sparse_dot_topn import sp_matmul_topn
+    HAS_SPARSE_DOT_TOPN = True
+except ImportError:
+    HAS_SPARSE_DOT_TOPN = False
+
+
 def generate_3gram_tfidf_candidates(
     df_s1: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_n_tfidf: int = 15,
     min_similarity: float = 0.22,
-    batch_size: int = 200
+    batch_size: int = 25000
 ) -> Dict[str, List[Tuple[str, float]]]:
     """
     Computes Top-N character 3-gram cosine similarity matches between S1 and Targets.
+    Uses multithreaded C++ sparse_dot_topn when available for maximum speed.
     Returns: {s1_id: [(target_id, score), ...]}
     """
     print(f"    [Signal A: TF-IDF] Vectorizing {len(df_targets):,} target names...")
@@ -84,7 +92,7 @@ def generate_3gram_tfidf_candidates(
     
     target_names = df_targets['clean_name'].fillna("").values
     X_targets = vectorizer.fit_transform(target_names)
-    X_targets_T = X_targets.T.tocsc()
+    X_targets_T = X_targets.T.tocsr() if HAS_SPARSE_DOT_TOPN else X_targets.T.tocsc()
     
     s1_names = df_s1['clean_name'].fillna("").values
     s1_ids = df_s1['entity_id'].values
@@ -92,19 +100,29 @@ def generate_3gram_tfidf_candidates(
     
     candidates_tfidf = defaultdict(list)
     
-    print(f"    [Signal A: TF-IDF] Querying {len(df_s1):,} anchors in batches of {batch_size:,}...")
+    actual_batch_size = batch_size if HAS_SPARSE_DOT_TOPN else 200
+    print(f"    [Signal A: TF-IDF] Querying {len(df_s1):,} anchors in batches of {actual_batch_size:,} (C++ Top-N: {HAS_SPARSE_DOT_TOPN})...")
     
-    num_batches = (len(df_s1) + batch_size - 1) // batch_size
+    num_batches = (len(df_s1) + actual_batch_size - 1) // actual_batch_size
     for b_idx in range(num_batches):
-        start_i = b_idx * batch_size
-        end_i = min(len(df_s1), (b_idx + 1) * batch_size)
+        start_i = b_idx * actual_batch_size
+        end_i = min(len(df_s1), (b_idx + 1) * actual_batch_size)
         
         batch_names = s1_names[start_i:end_i]
         X_s1_batch = vectorizer.transform(batch_names)
         
-        # Batch dot product: (batch_size x num_targets)
-        sim_matrix = X_s1_batch.dot(X_targets_T)
-        
+        if HAS_SPARSE_DOT_TOPN:
+            # Multithreaded C++ top-n sparse matrix multiplication
+            sim_matrix = sp_matmul_topn(
+                X_s1_batch,
+                X_targets_T,
+                top_n=top_n_tfidf,
+                threshold=min_similarity,
+                sort=True
+            )
+        else:
+            sim_matrix = X_s1_batch.dot(X_targets_T)
+            
         indptr = sim_matrix.indptr
         indices = sim_matrix.indices
         data = sim_matrix.data
@@ -121,29 +139,31 @@ def generate_3gram_tfidf_candidates(
             cols = indices[row_start:row_end]
             row_data = data[row_start:row_end]
             
-            # Filter by minimum similarity
-            valid_mask = row_data >= min_similarity
-            if not np.any(valid_mask):
-                continue
-                
-            valid_cols = cols[valid_mask]
-            valid_data = row_data[valid_mask]
-            
-            # Select top-N
-            if len(valid_data) > top_n_tfidf:
-                top_indices = np.argpartition(valid_data, -top_n_tfidf)[-top_n_tfidf:]
-                top_indices = top_indices[np.argsort(-valid_data[top_indices])]
-                sel_cols = valid_cols[top_indices]
-                sel_scores = valid_data[top_indices]
+            if HAS_SPARSE_DOT_TOPN:
+                # Already thresholded and sorted by top-N
+                for col, score in zip(cols, row_data):
+                    candidates_tfidf[s1_id].append((target_ids[col], float(score)))
             else:
-                sort_order = np.argsort(-valid_data)
-                sel_cols = valid_cols[sort_order]
-                sel_scores = valid_data[sort_order]
+                valid_mask = row_data >= min_similarity
+                if not np.any(valid_mask):
+                    continue
+                valid_cols = cols[valid_mask]
+                valid_data = row_data[valid_mask]
                 
-            for col, score in zip(sel_cols, sel_scores):
-                candidates_tfidf[s1_id].append((target_ids[col], float(score)))
+                if len(valid_data) > top_n_tfidf:
+                    top_indices = np.argpartition(valid_data, -top_n_tfidf)[-top_n_tfidf:]
+                    top_indices = top_indices[np.argsort(-valid_data[top_indices])]
+                    sel_cols = valid_cols[top_indices]
+                    sel_scores = valid_data[top_indices]
+                else:
+                    sort_order = np.argsort(-valid_data)
+                    sel_cols = valid_cols[sort_order]
+                    sel_scores = valid_data[sort_order]
+                    
+                for col, score in zip(sel_cols, sel_scores):
+                    candidates_tfidf[s1_id].append((target_ids[col], float(score)))
                 
-        if (b_idx + 1) % 50 == 0 or (b_idx + 1) == num_batches:
+        if (b_idx + 1) % 5 == 0 or (b_idx + 1) == num_batches:
             processed = end_i
             cur_elapsed = time.time() - t0
             print(f"      [TF-IDF] Processed {processed:,}/{len(df_s1):,} ({processed/len(df_s1)*100:.1f}%) in {cur_elapsed:.1f}s...")
