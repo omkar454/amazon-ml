@@ -13,9 +13,11 @@ import pandas as pd
 from blocking import (
     country_partition,
     generate_3gram_tfidf_candidates,
+    generate_3gram_tfidf_candidates_fast,
     generate_token_candidates,
     generate_address_number_candidates,
-    union_and_rank_candidates
+    union_and_rank_candidates,
+    SPARSE_DOT_TOPN_AVAILABLE,
 )
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -68,8 +70,9 @@ def generate_test_candidates(k: int = 20, min_sim: float = 0.20):
         
         t_p_start = time.time()
         
-        # Signal A: Char 3-gram TF-IDF
-        cands_tfidf = generate_3gram_tfidf_candidates(s1_sub, tgt_sub, top_n_tfidf=k, min_similarity=min_sim)
+        # Signal A: Char 3-gram TF-IDF (uses sparse_dot_topn if installed, else falls back to baseline)
+        _tfidf_fn = generate_3gram_tfidf_candidates_fast if SPARSE_DOT_TOPN_AVAILABLE else generate_3gram_tfidf_candidates
+        cands_tfidf = _tfidf_fn(s1_sub, tgt_sub, top_n_tfidf=k, min_similarity=min_sim)
         
         # Signal B: Brand Tokens
         cands_token = generate_token_candidates(s1_sub, tgt_sub, top_n_token=k)

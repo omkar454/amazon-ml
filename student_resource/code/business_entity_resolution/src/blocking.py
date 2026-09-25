@@ -18,6 +18,13 @@ from typing import Dict, List, Tuple, Set
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+# Try importing sparse_dot_topn (fast C++ sparse Top-K retrieval)
+try:
+    from sparse_dot_topn import sp_matmul_topn
+    SPARSE_DOT_TOPN_AVAILABLE = True
+except ImportError:
+    SPARSE_DOT_TOPN_AVAILABLE = False
+
 # Generic non-discriminative stop tokens to ignore in Brand Token Index
 GENERIC_STOP_TOKENS = {
     'and', 'the', 'of', 'for', 'in', 'at', 'by', 'with', 'from', 'to', 'on',
@@ -150,6 +157,98 @@ def generate_3gram_tfidf_candidates(
                 
     elapsed = time.time() - t0
     print(f"    [Signal A: TF-IDF] Complete in {elapsed:.2f}s ({len(df_s1)/elapsed:,.0f} queries/sec). Anchors with candidates: {len(candidates_tfidf):,}")
+    return candidates_tfidf
+
+
+# ==============================================================================
+# 2b. SIGNAL A (FAST): sparse_dot_topn C++ Top-K Sparse Matrix Retrieval
+# ==============================================================================
+
+def generate_3gram_tfidf_candidates_fast(
+    df_s1: pd.DataFrame,
+    df_targets: pd.DataFrame,
+    top_n_tfidf: int = 15,
+    min_similarity: float = 0.22,
+    batch_size: int = 5000
+) -> Dict[str, List[Tuple[str, float]]]:
+    """
+    Optimized Signal A using sparse_dot_topn.
+    Performs character 3-gram TF-IDF Top-K retrieval entirely in C++.
+    Orders of magnitude faster than the Python loop-based baseline.
+    Returns: {s1_id: [(target_id, score), ...]}
+
+    Requires: pip install sparse_dot_topn
+    Falls back to generate_3gram_tfidf_candidates() if not available.
+    """
+    if not SPARSE_DOT_TOPN_AVAILABLE:
+        print("    [Signal A FAST] sparse_dot_topn not available — falling back to slow baseline.")
+        return generate_3gram_tfidf_candidates(df_s1, df_targets, top_n_tfidf, min_similarity)
+
+    print(f"    [Signal A FAST: sparse_dot_topn] Vectorizing {len(df_targets):,} target names...")
+    t0 = time.time()
+
+    # Same TF-IDF config as the baseline — do NOT change this
+    vectorizer = TfidfVectorizer(
+        analyzer='char_wb',
+        ngram_range=(3, 3),
+        min_df=2,
+        max_features=120000,
+        sublinear_tf=True,
+        dtype=np.float32
+    )
+
+    target_names = df_targets['clean_name'].fillna("").values
+    X_targets    = vectorizer.fit_transform(target_names)  # (n_targets x n_features)
+    X_targets_T  = X_targets.T.tocsr()                    # (n_features x n_targets) for sp_matmul_topn
+
+    s1_names   = df_s1['clean_name'].fillna("").values
+    s1_ids     = df_s1['entity_id'].values
+    target_ids = df_targets['entity_id'].values
+
+    candidates_tfidf = defaultdict(list)
+    n_s1        = len(df_s1)
+    num_batches = (n_s1 + batch_size - 1) // batch_size
+    print(f"    [Signal A FAST] Querying {n_s1:,} anchors in {num_batches} batches of {batch_size:,}...")
+
+    for b_idx in range(num_batches):
+        start_i     = b_idx * batch_size
+        end_i       = min(n_s1, (b_idx + 1) * batch_size)
+        X_s1_batch  = vectorizer.transform(s1_names[start_i:end_i])
+
+        # C++ Top-K retrieval — never materialises the full matrix
+        sim_topk = sp_matmul_topn(
+            X_s1_batch,
+            X_targets_T,
+            top_n=top_n_tfidf,
+            threshold=min_similarity,
+            n_threads=1
+        )
+
+        indptr  = sim_topk.indptr
+        indices = sim_topk.indices
+        data    = sim_topk.data
+
+        for row_idx in range(end_i - start_i):
+            s1_id     = s1_ids[start_i + row_idx]
+            row_start = indptr[row_idx]
+            row_end   = indptr[row_idx + 1]
+            if row_start == row_end:
+                continue
+            cols     = indices[row_start:row_end]
+            row_data = data[row_start:row_end]
+            # Sort by descending score
+            for idx in np.argsort(-row_data):
+                candidates_tfidf[s1_id].append((target_ids[cols[idx]], float(row_data[idx])))
+
+        if (b_idx + 1) % 10 == 0 or (b_idx + 1) == num_batches:
+            processed   = end_i
+            cur_elapsed = time.time() - t0
+            rate        = processed / cur_elapsed if cur_elapsed > 0 else 0
+            eta         = (n_s1 - processed) / rate if rate > 0 else 0
+            print(f"      [TF-IDF FAST] {processed:,}/{n_s1:,} ({processed/n_s1*100:.1f}%) | {cur_elapsed:.1f}s | ETA {eta:.0f}s | {rate:,.0f} q/s")
+
+    elapsed = time.time() - t0
+    print(f"    [Signal A FAST] Complete in {elapsed:.2f}s ({n_s1/elapsed:,.0f} q/s). Anchors with candidates: {len(candidates_tfidf):,}")
     return candidates_tfidf
 
 
