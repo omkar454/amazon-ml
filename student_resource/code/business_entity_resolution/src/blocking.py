@@ -84,8 +84,8 @@ def generate_3gram_tfidf_candidates(
     vectorizer = TfidfVectorizer(
         analyzer='char_wb',
         ngram_range=(3, 3),
-        min_df=2,
-        max_features=120000,
+        min_df=5,
+        max_features=80000,
         sublinear_tf=True,
         dtype=np.float32
     )

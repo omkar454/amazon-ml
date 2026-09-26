@@ -268,7 +268,7 @@ def train_lightgbm_matcher(df_train: pd.DataFrame):
         f05 = fbeta_score(y, pred_binary, beta=0.5, zero_division=0)
         f1 = fbeta_score(y, pred_binary, beta=1.0, zero_division=0)
         
-        star = " ★ BEST" if f05 > best_f05 else ""
+        star = " * BEST" if f05 > best_f05 else ""
         print(f"{thresh:10.2f} | {p*100:9.2f}% | {r*100:9.2f}% | {f05*100:11.2f}% | {f1*100:9.2f}%{star}")
         
         if f05 > best_f05:
@@ -337,8 +337,16 @@ def main():
                 if tid.strip():
                     ground_truth_dict[s1_id].add(tid.strip())
                     
-    # 2. Build Dataset
-    df_dataset = build_training_dataset(df_s1, df_targets, ground_truth_dict)
+    # 2. Build or Load Dataset
+    dataset_cache_path = os.path.join(MODEL_DIR, "train_pairs_dataset.parquet")
+    if os.path.isfile(dataset_cache_path):
+        print(f"\nLoading cached labeled dataset from {dataset_cache_path}...")
+        df_dataset = pd.read_parquet(dataset_cache_path)
+        print(f"Loaded {len(df_dataset):,} labeled pairs from cache!")
+    else:
+        df_dataset = build_training_dataset(df_s1, df_targets, ground_truth_dict)
+        print(f"Saving labeled dataset to cache at {dataset_cache_path}...")
+        df_dataset.to_parquet(dataset_cache_path, index=False)
     
     # 3. Train & Tune LightGBM
     train_lightgbm_matcher(df_dataset)
