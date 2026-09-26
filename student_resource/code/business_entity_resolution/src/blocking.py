@@ -27,7 +27,7 @@ from typing import Dict, List, Tuple, Iterator, Optional
 
 import numpy as np
 import pandas as pd
-
+import re
 # ---------------------------------------------------------------------
 # Optional imports
 # ---------------------------------------------------------------------
