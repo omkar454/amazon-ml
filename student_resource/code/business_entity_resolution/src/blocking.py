@@ -1,481 +1,1466 @@
 """
 High-Recall Scalable Blocking / Candidate Generation Engine
-Multi-signal candidate generation across:
-1. Dynamic Country Partitioning (US, India, France, etc.)
-2. Signal A: Character 3-Gram Sparse TF-IDF Cosine Retrieval
-3. Signal B: Distinct Brand Token Inverted Index
-4. Signal C: Physical Address Number Co-occurrence
-5. Candidate Union, Scoring, and Top-K Selection
+
+Signals:
+    A. Multilingual E5 embeddings + FAISS IVF-PQ ANN retrieval
+    B. Distinct brand token inverted index
+    C. Physical address number co-occurrence
+
+Pipeline:
+    Country Partition
+        ↓
+    Signal A: Embedding + FAISS
+        ↓
+    Signal B: Brand Tokens
+        ↓
+    Signal C: Address Numbers
+        ↓
+    Union + Ranking
+        ↓
+    Top-K Candidates
 """
 
 import os
-import re
+import json
 import time
+from collections import defaultdict
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-from typing import Dict, List, Tuple, Set
-from scipy.sparse import csr_matrix
-from sklearn.feature_extraction.text import TfidfVectorizer
 
-# Try importing sparse_dot_topn (fast C++ sparse Top-K retrieval)
 try:
-    from sparse_dot_topn import sp_matmul_topn
-    SPARSE_DOT_TOPN_AVAILABLE = True
+    import faiss
+    FAISS_AVAILABLE = True
 except ImportError:
-    SPARSE_DOT_TOPN_AVAILABLE = False
+    FAISS_AVAILABLE = False
 
-# Generic non-discriminative stop tokens to ignore in Brand Token Index
-GENERIC_STOP_TOKENS = {
-    'and', 'the', 'of', 'for', 'in', 'at', 'by', 'with', 'from', 'to', 'on',
-    'services', 'service', 'enterprises', 'enterprise', 'traders', 'trading',
-    'solutions', 'technologies', 'technology', 'consultants', 'consulting',
-    'management', 'group', 'india', 'national', 'international', 'global',
-    'center', 'centre', 'associates', 'holdings', 'holding', 'industries',
-    'industry', 'products', 'product', 'corporation', 'corp', 'company', 'co',
-    'limited', 'ltd', 'pvt', 'private', 'llc', 'llp', 'inc', 'sarl', 'sas',
-    'sasu', 'eurl', 'et', 'fils'
-}
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
-# ==============================================================================
-# 1. DYNAMIC COUNTRY PARTITIONING
-# ==============================================================================
 
-def country_partition(df_s1: pd.DataFrame, df_targets: pd.DataFrame) -> Dict[str, Dict[str, pd.DataFrame]]:
-    """
-    Dynamically partitions S1 anchors and S2/S3 targets by country.
-    Open-set: automatically discovers countries present (US, INDIA, FRANCE, etc.).
-    """
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
+
+IVF_NLIST = 2048
+PQ_M = 48
+PQ_NBITS = 8
+NPROBE = 32
+
+INDEX_VERSION = "ivf-pq-v2"
+
+
+# =============================================================================
+# EMBEDDING MODEL
+# =============================================================================
+
+_embedding_model = None
+
+
+def get_embedding_model():
+
+    global _embedding_model
+
+    if _embedding_model is None:
+
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError(
+                "sentence-transformers is not installed."
+            )
+
+        device = "cuda"
+
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                device = "cpu"
+
+        except Exception:
+            device = "cpu"
+
+        print(
+            f"[Embedding] Loading "
+            f"{EMBEDDING_MODEL}"
+        )
+
+        print(
+            f"[Embedding] Device: {device}"
+        )
+
+        _embedding_model = SentenceTransformer(
+            EMBEDDING_MODEL,
+            device=device
+        )
+
+    return _embedding_model
+
+
+# =============================================================================
+# COUNTRY PARTITIONING
+# =============================================================================
+
+def country_partition(
+    df_s1: pd.DataFrame,
+    df_targets: pd.DataFrame
+):
+
     partitions = {}
-    unique_countries = df_s1['country'].unique()
-    
-    for c in unique_countries:
-        s1_subset = df_s1[df_s1['country'] == c].reset_index(drop=True)
-        target_subset = df_targets[df_targets['country'] == c].reset_index(drop=True)
-        
-        partitions[c] = {
-            "s1": s1_subset,
-            "targets": target_subset
+
+    if "country" not in df_s1.columns:
+        raise ValueError(
+            "S1 dataframe must contain 'country'"
+        )
+
+    if "country" not in df_targets.columns:
+        raise ValueError(
+            "Target dataframe must contain 'country'"
+        )
+
+    countries = sorted(
+        set(df_s1["country"].astype(str))
+    )
+
+    for country in countries:
+
+        s1_mask = (
+            df_s1["country"].astype(str)
+            == str(country)
+        )
+
+        target_mask = (
+            df_targets["country"].astype(str)
+            == str(country)
+        )
+
+        s1_sub = df_s1.loc[
+            s1_mask
+        ].copy()
+
+        target_sub = df_targets.loc[
+            target_mask
+        ].copy()
+
+        partitions[country] = {
+            "s1": s1_sub,
+            "targets": target_sub
         }
-        
+
     return partitions
 
 
-# ==============================================================================
-# 2. SIGNAL A: CHARACTER 3-GRAM TF-IDF COSINE RETRIEVAL
-# ==============================================================================
+# =============================================================================
+# FAISS CHECKPOINT HELPERS
+# =============================================================================
 
-def generate_3gram_tfidf_candidates(
-    df_s1: pd.DataFrame,
-    df_targets: pd.DataFrame,
-    top_n_tfidf: int = 15,
-    min_similarity: float = 0.22,
-    batch_size: int = 200
-) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    Computes Top-N character 3-gram cosine similarity matches between S1 and Targets.
-    Returns: {s1_id: [(target_id, score), ...]}
-    """
-    print(f"    [Signal A: TF-IDF] Vectorizing {len(df_targets):,} target names...")
-    t0 = time.time()
-    
-    # Fit vectorizer on target clean_name
-    vectorizer = TfidfVectorizer(
-        analyzer='char_wb',
-        ngram_range=(3, 3),
-        min_df=2,
-        max_features=120000,
-        sublinear_tf=True,
-        dtype=np.float32
-    )
-    
-    target_names = df_targets['clean_name'].fillna("").values
-    X_targets = vectorizer.fit_transform(target_names)
-    X_targets_T = X_targets.T.tocsc()
-    
-    s1_names = df_s1['clean_name'].fillna("").values
-    s1_ids = df_s1['entity_id'].values
-    target_ids = df_targets['entity_id'].values
-    
-    candidates_tfidf = defaultdict(list)
-    
-    print(f"    [Signal A: TF-IDF] Querying {len(df_s1):,} anchors in batches of {batch_size:,}...")
-    
-    num_batches = (len(df_s1) + batch_size - 1) // batch_size
-    for b_idx in range(num_batches):
-        start_i = b_idx * batch_size
-        end_i = min(len(df_s1), (b_idx + 1) * batch_size)
-        
-        batch_names = s1_names[start_i:end_i]
-        X_s1_batch = vectorizer.transform(batch_names)
-        
-        # Batch dot product: (batch_size x num_targets)
-        sim_matrix = X_s1_batch.dot(X_targets_T)
-        
-        indptr = sim_matrix.indptr
-        indices = sim_matrix.indices
-        data = sim_matrix.data
-        
-        for row_idx in range(end_i - start_i):
-            global_s1_idx = start_i + row_idx
-            s1_id = s1_ids[global_s1_idx]
-            
-            row_start = indptr[row_idx]
-            row_end = indptr[row_idx + 1]
-            if row_start == row_end:
-                continue
-                
-            cols = indices[row_start:row_end]
-            row_data = data[row_start:row_end]
-            
-            # Filter by minimum similarity
-            valid_mask = row_data >= min_similarity
-            if not np.any(valid_mask):
-                continue
-                
-            valid_cols = cols[valid_mask]
-            valid_data = row_data[valid_mask]
-            
-            # Select top-N
-            if len(valid_data) > top_n_tfidf:
-                top_indices = np.argpartition(valid_data, -top_n_tfidf)[-top_n_tfidf:]
-                top_indices = top_indices[np.argsort(-valid_data[top_indices])]
-                sel_cols = valid_cols[top_indices]
-                sel_scores = valid_data[top_indices]
-            else:
-                sort_order = np.argsort(-valid_data)
-                sel_cols = valid_cols[sort_order]
-                sel_scores = valid_data[sort_order]
-                
-            for col, score in zip(sel_cols, sel_scores):
-                candidates_tfidf[s1_id].append((target_ids[col], float(score)))
-                
-        if (b_idx + 1) % 50 == 0 or (b_idx + 1) == num_batches:
-            processed = end_i
-            cur_elapsed = time.time() - t0
-            print(f"      [TF-IDF] Processed {processed:,}/{len(df_s1):,} ({processed/len(df_s1)*100:.1f}%) in {cur_elapsed:.1f}s...")
-                
-    elapsed = time.time() - t0
-    print(f"    [Signal A: TF-IDF] Complete in {elapsed:.2f}s ({len(df_s1)/elapsed:,.0f} queries/sec). Anchors with candidates: {len(candidates_tfidf):,}")
-    return candidates_tfidf
+def _atomic_write_faiss_index(
+    index,
+    path: str
+):
 
+    tmp_path = path + ".tmp"
 
-# ==============================================================================
-# 2b. SIGNAL A (FAST): sparse_dot_topn C++ Top-K Sparse Matrix Retrieval
-# ==============================================================================
+    # If index is on GPU, move it back to CPU
+    try:
+        cpu_index = faiss.index_gpu_to_cpu(index)
+    except Exception:
+        cpu_index = index
 
-def generate_3gram_tfidf_candidates_fast(
-    df_s1: pd.DataFrame,
-    df_targets: pd.DataFrame,
-    top_n_tfidf: int = 15,
-    min_similarity: float = 0.22,
-    batch_size: int = 5000
-) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    Optimized Signal A using sparse_dot_topn.
-    Performs character 3-gram TF-IDF Top-K retrieval entirely in C++.
-    Orders of magnitude faster than the Python loop-based baseline.
-    Returns: {s1_id: [(target_id, score), ...]}
-
-    Requires: pip install sparse_dot_topn
-    Falls back to generate_3gram_tfidf_candidates() if not available.
-    """
-    if not SPARSE_DOT_TOPN_AVAILABLE:
-        print("    [Signal A FAST] sparse_dot_topn not available — falling back to slow baseline.")
-        return generate_3gram_tfidf_candidates(df_s1, df_targets, top_n_tfidf, min_similarity)
-
-    print(f"    [Signal A FAST: sparse_dot_topn] Vectorizing {len(df_targets):,} target names...")
-    t0 = time.time()
-
-    # Same TF-IDF config as the baseline — do NOT change this
-    vectorizer = TfidfVectorizer(
-        analyzer='char_wb',
-        ngram_range=(3, 3),
-        min_df=2,
-        max_features=120000,
-        sublinear_tf=True,
-        dtype=np.float32
+    faiss.write_index(
+        cpu_index,
+        tmp_path
     )
 
-    target_names = df_targets['clean_name'].fillna("").values
-    X_targets    = vectorizer.fit_transform(target_names)  # (n_targets x n_features)
-    X_targets_T  = X_targets.T.tocsr()                    # (n_features x n_targets) for sp_matmul_topn
+    os.replace(
+        tmp_path,
+        path
+    )
 
-    s1_names   = df_s1['clean_name'].fillna("").values
-    s1_ids     = df_s1['entity_id'].values
-    target_ids = df_targets['entity_id'].values
 
-    candidates_tfidf = defaultdict(list)
-    n_s1        = len(df_s1)
-    num_batches = (n_s1 + batch_size - 1) // batch_size
-    print(f"    [Signal A FAST] Querying {n_s1:,} anchors in {num_batches} batches of {batch_size:,}...")
+def _load_faiss_index(
+    path: str
+):
 
-    for b_idx in range(num_batches):
-        start_i     = b_idx * batch_size
-        end_i       = min(n_s1, (b_idx + 1) * batch_size)
-        X_s1_batch  = vectorizer.transform(s1_names[start_i:end_i])
+    if not os.path.isfile(path):
+        return None
 
-        # C++ Top-K retrieval — never materialises the full matrix
-        sim_topk = sp_matmul_topn(
-            X_s1_batch,
-            X_targets_T,
-            top_n=top_n_tfidf,
-            threshold=min_similarity,
-            n_threads=1
+    return faiss.read_index(
+        path
+    )
+
+
+def _save_metadata(
+    metadata: dict,
+    path: str
+):
+
+    tmp_path = path + ".tmp"
+
+    with open(
+        tmp_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=2
         )
 
-        indptr  = sim_topk.indptr
-        indices = sim_topk.indices
-        data    = sim_topk.data
+    os.replace(
+        tmp_path,
+        path
+    )
 
-        for row_idx in range(end_i - start_i):
-            s1_id     = s1_ids[start_i + row_idx]
-            row_start = indptr[row_idx]
-            row_end   = indptr[row_idx + 1]
-            if row_start == row_end:
+
+def _load_metadata(
+    path: str
+):
+
+    if not os.path.isfile(path):
+        return None
+
+    with open(
+        path,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        return json.load(f)
+
+
+# =============================================================================
+# CREATE GPU INDEX
+# =============================================================================
+
+def _create_gpu_index(
+    cpu_index
+):
+
+    if not faiss.get_num_gpus():
+        return cpu_index
+
+    try:
+
+        res = faiss.StandardGpuResources()
+
+        gpu_index = faiss.index_cpu_to_gpu(
+            res,
+            0,
+            cpu_index
+        )
+
+        return gpu_index
+
+    except Exception as e:
+
+        print(
+            f"[FAISS] GPU conversion failed: "
+            f"{e}"
+        )
+
+        return cpu_index
+
+
+# =============================================================================
+# TRAIN IVF-PQ
+# =============================================================================
+
+def _train_ivf_pq(
+    target_texts: List[str]
+):
+
+    model = get_embedding_model()
+
+    sample_size = min(
+        100_000,
+        len(target_texts)
+    )
+
+    train_texts = target_texts[
+        :sample_size
+    ]
+
+    print(
+        f"[Signal A] Training IVF-PQ "
+        f"on first {sample_size:,} target names"
+    )
+
+    embeddings = model.encode(
+        [
+            "passage: " + str(x)
+            for x in train_texts
+        ],
+        batch_size=256,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    embeddings = np.asarray(
+        embeddings,
+        dtype=np.float32
+    )
+
+    dimension = embeddings.shape[1]
+
+    print(
+        f"[Signal A] Embedding dimension: "
+        f"{dimension}"
+    )
+
+    if dimension % PQ_M != 0:
+
+        raise ValueError(
+            f"Embedding dimension {dimension} "
+            f"is not divisible by PQ_M={PQ_M}"
+        )
+
+    quantizer = faiss.IndexFlatIP(
+        dimension
+    )
+
+    index = faiss.IndexIVFPQ(
+        quantizer,
+        dimension,
+        IVF_NLIST,
+        PQ_M,
+        PQ_NBITS,
+        faiss.METRIC_INNER_PRODUCT
+    )
+
+    print(
+        "[Signal A] Training IVF-PQ..."
+    )
+
+    index.train(
+        embeddings
+    )
+
+    print(
+        "[Signal A] IVF-PQ training complete."
+    )
+
+    return index
+
+
+# =============================================================================
+# SIGNAL A
+# MULTILINGUAL E5 + FAISS IVF-PQ
+# =============================================================================
+
+def generate_embedding_candidates(
+    df_s1: pd.DataFrame,
+    df_targets: pd.DataFrame,
+    top_k: int = 20,
+    target_chunk_size: int = 100_000,
+    query_chunk_size: int = 10_000,
+    checkpoint_dir: str = None
+):
+
+    if not FAISS_AVAILABLE:
+        raise ImportError(
+            "faiss is required for "
+            "embedding candidate generation."
+        )
+
+    print("\n" + "=" * 80)
+    print(
+        "SIGNAL A — IVF-PQ EMBEDDING BLOCKING"
+    )
+    print("=" * 80)
+
+    print(
+        f"S1 records     : {len(df_s1):,}"
+    )
+
+    print(
+        f"Target records : {len(df_targets):,}"
+    )
+
+    print(
+        f"Top-K          : {top_k}"
+    )
+
+    print(
+        f"Target chunk   : {target_chunk_size:,}"
+    )
+
+    print(
+        f"Query chunk    : {query_chunk_size:,}"
+    )
+
+    print(
+        f"nlist          : {IVF_NLIST}"
+    )
+
+    print(
+        f"PQ m           : {PQ_M}"
+    )
+
+    print(
+        f"nprobe         : {NPROBE}"
+    )
+
+    print(
+        f"Embedding model: {EMBEDDING_MODEL}"
+    )
+
+    if checkpoint_dir is None:
+
+        checkpoint_dir = "./signal_a_checkpoint"
+
+    os.makedirs(
+        checkpoint_dir,
+        exist_ok=True
+    )
+
+    index_path = os.path.join(
+        checkpoint_dir,
+        "targets_ivfpq.faiss"
+    )
+
+    metadata_path = os.path.join(
+        checkpoint_dir,
+        "metadata.json"
+    )
+
+    query_dir = os.path.join(
+        checkpoint_dir,
+        "query_chunks"
+    )
+
+    os.makedirs(
+        query_dir,
+        exist_ok=True
+    )
+
+    # -------------------------------------------------------------------------
+    # VALIDATE INPUT
+    # -------------------------------------------------------------------------
+
+    required_s1 = [
+        "entity_id",
+        "clean_name"
+    ]
+
+    required_target = [
+        "entity_id",
+        "clean_name"
+    ]
+
+    for col in required_s1:
+
+        if col not in df_s1.columns:
+            raise ValueError(
+                f"S1 missing column: {col}"
+            )
+
+    for col in required_target:
+
+        if col not in df_targets.columns:
+            raise ValueError(
+                f"Target missing column: {col}"
+            )
+
+    # -------------------------------------------------------------------------
+    # LOAD MODEL
+    # -------------------------------------------------------------------------
+
+    model = get_embedding_model()
+
+    # -------------------------------------------------------------------------
+    # LOAD OR CREATE FAISS INDEX
+    # -------------------------------------------------------------------------
+
+    print(
+        "\n[Signal A] Loading FAISS checkpoint:"
+    )
+
+    print(
+        f"            {index_path}"
+    )
+
+    index = _load_faiss_index(
+        index_path
+    )
+
+    metadata = _load_metadata(
+        metadata_path
+    )
+
+    total_targets = len(
+        df_targets
+    )
+
+    if index is not None:
+
+        print(
+            f"[Signal A] Checkpoint vectors: "
+            f"{index.ntotal:,}"
+        )
+
+        compatible = True
+
+        if metadata is not None:
+
+            if metadata.get(
+                "embedding_model"
+            ) != EMBEDDING_MODEL:
+
+                compatible = False
+
+            if metadata.get(
+                "total_targets"
+            ) != total_targets:
+
+                compatible = False
+
+            if metadata.get(
+                "target_chunk_size"
+            ) != target_chunk_size:
+
+                compatible = False
+
+            if metadata.get(
+                "ivf_nlist"
+            ) != IVF_NLIST:
+
+                compatible = False
+
+            if metadata.get(
+                "pq_m"
+            ) != PQ_M:
+
+                compatible = False
+
+            if metadata.get(
+                "pq_nbits"
+            ) != PQ_NBITS:
+
+                compatible = False
+
+        if not compatible:
+
+            print(
+                "[Signal A] Existing checkpoint "
+                "is incompatible."
+            )
+
+            print(
+                "[Signal A] Rebuilding index."
+            )
+
+            index = None
+
+        else:
+
+            print(
+                f"[Signal A] Existing index contains "
+                f"{index.ntotal:,} vectors."
+            )
+
+    # -------------------------------------------------------------------------
+    # CREATE INDEX IF NEEDED
+    # -------------------------------------------------------------------------
+
+    if index is None:
+
+        target_texts = (
+            df_targets["clean_name"]
+            .astype(str)
+            .tolist()
+        )
+
+        index = _train_ivf_pq(
+            target_texts
+        )
+
+        metadata = {
+            "index_version": INDEX_VERSION,
+            "embedding_model": EMBEDDING_MODEL,
+            "total_targets": total_targets,
+            "target_chunk_size": target_chunk_size,
+            "ivf_nlist": IVF_NLIST,
+            "pq_m": PQ_M,
+            "pq_nbits": PQ_NBITS,
+            "ntotal": 0
+        }
+
+    # -------------------------------------------------------------------------
+    # PHASE 1
+    # TARGET INDEXING
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 80)
+    print(
+        "PHASE 1 — TARGET INDEXING"
+    )
+    print("=" * 80)
+
+    indexed_count = int(
+        index.ntotal
+    )
+
+    if indexed_count > total_targets:
+
+        raise RuntimeError(
+            "Checkpoint contains more vectors "
+            "than current target dataset."
+        )
+
+    if indexed_count < total_targets:
+
+        print(
+            f"[Signal A] Resuming from "
+            f"{indexed_count:,}"
+        )
+
+        gpu_index = _create_gpu_index(
+            index
+        )
+
+        try:
+
+            gpu_index.nprobe = NPROBE
+
+        except Exception:
+            pass
+
+        for start_idx in range(
+            indexed_count,
+            total_targets,
+            target_chunk_size
+        ):
+
+            end_idx = min(
+                start_idx + target_chunk_size,
+                total_targets
+            )
+
+            print(
+                f"\n[Signal A] Target chunk "
+                f"{start_idx:,} → {end_idx:,}"
+            )
+
+            chunk_texts = (
+                df_targets["clean_name"]
+                .iloc[
+                    start_idx:end_idx
+                ]
+                .astype(str)
+                .tolist()
+            )
+
+            t_chunk = time.time()
+
+            embeddings = model.encode(
+                [
+                    "passage: " + x
+                    for x in chunk_texts
+                ],
+                batch_size=256,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+
+            embeddings = np.asarray(
+                embeddings,
+                dtype=np.float32
+            )
+
+            gpu_index.add(
+                embeddings
+            )
+
+            print(
+                f"[Signal A] Added "
+                f"{len(embeddings):,} vectors "
+                f"in {time.time() - t_chunk:.2f}s"
+            )
+
+            # Save checkpoint
+            _atomic_write_faiss_index(
+                gpu_index,
+                index_path
+            )
+
+            metadata["ntotal"] = int(
+                end_idx
+            )
+
+            _save_metadata(
+                metadata,
+                metadata_path
+            )
+
+            print(
+                f"[Signal A] Checkpoint saved: "
+                f"{end_idx:,}/{total_targets:,}"
+            )
+
+        index = _load_faiss_index(
+            index_path
+        )
+
+    else:
+
+        print(
+            "\n[Signal A] ALL TARGETS INDEXED"
+        )
+
+    # -------------------------------------------------------------------------
+    # PHASE 2
+    # QUERY SEARCH
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 80)
+    print(
+        "PHASE 2 — S1 ANN SEARCH"
+    )
+    print("=" * 80)
+
+    index = _load_faiss_index(
+        index_path
+    )
+
+    gpu_index = _create_gpu_index(
+        index
+    )
+
+    try:
+
+        gpu_index.nprobe = NPROBE
+
+    except Exception:
+        pass
+
+    total_queries = len(
+        df_s1
+    )
+
+    # -------------------------------------------------------------------------
+    # SEARCH QUERY CHUNKS
+    # -------------------------------------------------------------------------
+
+    for start_idx in range(
+        0,
+        total_queries,
+        query_chunk_size
+    ):
+
+        end_idx = min(
+            start_idx + query_chunk_size,
+            total_queries
+        )
+
+        chunk_number = (
+            start_idx // query_chunk_size
+        )
+
+        chunk_path = os.path.join(
+            query_dir,
+            f"query_{chunk_number:06d}.npz"
+        )
+
+        # Already completed
+        if os.path.isfile(
+            chunk_path
+        ):
+
+            print(
+                f"[Signal A] Query chunk "
+                f"{chunk_number} already exists. "
+                f"Skipping."
+            )
+
+            continue
+
+        print(
+            f"\n[Signal A] Query chunk "
+            f"{chunk_number}"
+        )
+
+        print(
+            f"           rows "
+            f"{start_idx:,} → {end_idx:,}"
+        )
+
+        query_texts = (
+            df_s1["clean_name"]
+            .iloc[
+                start_idx:end_idx
+            ]
+            .astype(str)
+            .tolist()
+        )
+
+        t_query = time.time()
+
+        query_embeddings = model.encode(
+            [
+                "query: " + x
+                for x in query_texts
+            ],
+            batch_size=256,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+
+        query_embeddings = np.asarray(
+            query_embeddings,
+            dtype=np.float32
+        )
+
+        scores, indices = gpu_index.search(
+            query_embeddings,
+            top_k
+        )
+
+        print(
+            f"[Signal A] Query completed "
+            f"in {time.time() - t_query:.2f}s"
+        )
+
+        print(
+            f"[Signal A] Progress: "
+            f"{end_idx:,}/{total_queries:,} "
+            f"({end_idx / total_queries * 100:.2f}%)"
+        )
+
+        # ---------------------------------------------------------------------
+        # IMPORTANT: SAFE NPZ SAVE
+        # ---------------------------------------------------------------------
+
+        tmp_path = chunk_path + ".tmp"
+
+        with open(
+            tmp_path,
+            "wb"
+        ) as f:
+
+            np.savez(
+                f,
+                scores=scores.astype(
+                    np.float32
+                ),
+                indices=indices.astype(
+                    np.int64
+                ),
+                start_idx=np.int64(
+                    start_idx
+                ),
+                end_idx=np.int64(
+                    end_idx
+                )
+            )
+
+        os.replace(
+            tmp_path,
+            chunk_path
+        )
+
+        print(
+            f"[Signal A] Saved query chunk: "
+            f"{chunk_path}"
+        )
+
+    # -------------------------------------------------------------------------
+    # PHASE 3
+    # BUILD CANDIDATE DICTIONARY
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 80)
+    print(
+        "PHASE 3 — BUILD SIGNAL-A CANDIDATES"
+    )
+    print("=" * 80)
+
+    candidates = defaultdict(list)
+
+    target_ids = (
+        df_targets["entity_id"]
+        .astype(str)
+        .tolist()
+    )
+
+    s1_ids = (
+        df_s1["entity_id"]
+        .astype(str)
+        .tolist()
+    )
+
+    query_files = sorted(
+        [
+            x
+            for x in os.listdir(query_dir)
+            if x.endswith(".npz")
+            and x.startswith("query_")
+        ]
+    )
+
+    for query_file in query_files:
+
+        path = os.path.join(
+            query_dir,
+            query_file
+        )
+
+        data = np.load(
+            path
+        )
+
+        scores = data["scores"]
+        indices = data["indices"]
+
+        start_idx = int(
+            data["start_idx"]
+        )
+
+        for local_idx in range(
+            len(scores)
+        ):
+
+            s1_index = (
+                start_idx + local_idx
+            )
+
+            if s1_index >= len(s1_ids):
                 continue
-            cols     = indices[row_start:row_end]
-            row_data = data[row_start:row_end]
-            # Sort by descending score
-            for idx in np.argsort(-row_data):
-                candidates_tfidf[s1_id].append((target_ids[cols[idx]], float(row_data[idx])))
 
-        if (b_idx + 1) % 10 == 0 or (b_idx + 1) == num_batches:
-            processed   = end_i
-            cur_elapsed = time.time() - t0
-            rate        = processed / cur_elapsed if cur_elapsed > 0 else 0
-            eta         = (n_s1 - processed) / rate if rate > 0 else 0
-            print(f"      [TF-IDF FAST] {processed:,}/{n_s1:,} ({processed/n_s1*100:.1f}%) | {cur_elapsed:.1f}s | ETA {eta:.0f}s | {rate:,.0f} q/s")
+            s1_id = s1_ids[
+                s1_index
+            ]
 
-    elapsed = time.time() - t0
-    print(f"    [Signal A FAST] Complete in {elapsed:.2f}s ({n_s1/elapsed:,.0f} q/s). Anchors with candidates: {len(candidates_tfidf):,}")
-    return candidates_tfidf
+            for j in range(
+                len(scores[local_idx])
+            ):
+
+                target_index = int(
+                    indices[
+                        local_idx,
+                        j
+                    ]
+                )
+
+                if target_index < 0:
+                    continue
+
+                if target_index >= len(
+                    target_ids
+                ):
+                    continue
+
+                target_id = target_ids[
+                    target_index
+                ]
+
+                score = float(
+                    scores[
+                        local_idx,
+                        j
+                    ]
+                )
+
+                candidates[s1_id].append(
+                    (
+                        target_id,
+                        score
+                    )
+                )
+
+    print(
+        f"[Signal A] S1 entities: "
+        f"{len(s1_ids):,}"
+    )
+
+    print(
+        f"[Signal A] Candidate pairs: "
+        f"{sum(len(v) for v in candidates.values()):,}"
+    )
+
+    print(
+        f"[Signal A] Average candidates/S1: "
+        f"{sum(len(v) for v in candidates.values()) / len(s1_ids):.2f}"
+    )
+
+    print(
+        "\n[Signal A] COMPLETE."
+    )
+
+    return dict(
+        candidates
+    )
 
 
-# ==============================================================================
-# 3. SIGNAL B: BRAND TOKEN INVERTED INDEX
-# ==============================================================================
+# =============================================================================
+# SIGNAL B
+# DISTINCT BRAND TOKEN INVERTED INDEX
+# =============================================================================
+
+GENERIC_STOP_TOKENS = {
+    "the",
+    "and",
+    "of",
+    "for",
+    "a",
+    "an",
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "inc",
+    "incorporated",
+    "ltd",
+    "limited",
+    "llc",
+    "llp",
+    "pvt",
+    "private",
+    "priv",
+    "services",
+    "service",
+    "group",
+    "international",
+    "india",
+    "usa",
+    "us"
+}
+
 
 def generate_token_candidates(
     df_s1: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_n_token: int = 10,
     max_token_postings: int = 5000
-) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    Builds inverted index on informative brand tokens and queries matching records.
-    Returns: {s1_id: [(target_id, score), ...]}
-    """
-    print(f"    [Signal B: Token Index] Building inverted index on {len(df_targets):,} target names...")
+):
+
+    print(
+        f"    [Signal B: Token Index] "
+        f"Building inverted index on "
+        f"{len(df_targets):,} target names..."
+    )
+
+    inverted_index = defaultdict(list)
+
+    target_names = (
+        df_targets["clean_name"]
+        .astype(str)
+        .tolist()
+    )
+
+    target_ids = (
+        df_targets["entity_id"]
+        .astype(str)
+        .tolist()
+    )
+
+    # -------------------------------------------------------------------------
+    # BUILD INDEX
+    # -------------------------------------------------------------------------
+
+    for idx, name in enumerate(
+        target_names
+    ):
+
+        tokens = set(
+            name.lower().split()
+        )
+
+        tokens = {
+            token
+            for token in tokens
+            if token
+            and token not in GENERIC_STOP_TOKENS
+        }
+
+        for token in tokens:
+
+            inverted_index[token].append(
+                idx
+            )
+
+    # Remove overly common tokens
+    for token in list(
+        inverted_index.keys()
+    ):
+
+        if len(
+            inverted_index[token]
+        ) > max_token_postings:
+
+            del inverted_index[token]
+
+    # -------------------------------------------------------------------------
+    # QUERY
+    # -------------------------------------------------------------------------
+
+    print(
+        f"    [Signal B: Token Index] "
+        f"Querying {len(df_s1):,} anchors..."
+    )
+
+    candidates = defaultdict(list)
+
     t0 = time.time()
-    
-    target_ids = df_targets['entity_id'].values
-    target_names = df_targets['clean_name'].fillna("").values
-    
-    token_index = defaultdict(list)
-    for idx, name in enumerate(target_names):
-        words = set(name.split())
-        for w in words:
-            if len(w) >= 3 and w not in GENERIC_STOP_TOKENS:
-                token_index[w].append(idx)
-                
-    # Filter out tokens with too many postings to avoid memory explosion on generic tokens
-    filtered_index = {k: v for k, v in token_index.items() if len(v) <= max_token_postings}
-    
-    s1_ids = df_s1['entity_id'].values
-    s1_names = df_s1['clean_name'].fillna("").values
-    
-    candidates_token = defaultdict(list)
-    print(f"    [Signal B: Token Index] Querying {len(df_s1):,} anchors...")
-    
-    for s1_idx, name in enumerate(s1_names):
-        s1_id = s1_ids[s1_idx]
-        words = [w for w in set(name.split()) if len(w) >= 3 and w in filtered_index]
-        if not words:
-            continue
-            
-        # Count hits per target
-        target_hits = defaultdict(float)
-        for w in words:
-            postings = filtered_index[w]
-            # IDF-like weight: rarer words have higher weight
-            weight = 1.0 / np.log1p(len(postings))
-            for t_idx in postings:
-                target_hits[t_idx] += weight
-                
-        if not target_hits:
-            continue
-            
-        # Sort targets by score and take top_n_token
-        sorted_hits = sorted(target_hits.items(), key=lambda x: x[1], reverse=True)[:top_n_token]
-        for t_idx, score in sorted_hits:
-            candidates_token[s1_id].append((target_ids[t_idx], float(score)))
-            
+
+    for _, row in df_s1.iterrows():
+
+        s1_id = str(
+            row["entity_id"]
+        )
+
+        name = str(
+            row["clean_name"]
+        )
+
+        tokens = set(
+            name.lower().split()
+        )
+
+        tokens = {
+            token
+            for token in tokens
+            if token
+            and token not in GENERIC_STOP_TOKENS
+        }
+
+        scores = defaultdict(float)
+
+        for token in tokens:
+
+            postings = inverted_index.get(
+                token,
+                []
+            )
+
+            if not postings:
+                continue
+
+            weight = 1.0 / np.log1p(
+                len(postings)
+            )
+
+            for target_idx in postings:
+
+                scores[target_idx] += weight
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_n_token]
+
+        candidates[s1_id] = [
+            (
+                target_ids[idx],
+                float(score)
+            )
+            for idx, score in ranked
+        ]
+
     elapsed = time.time() - t0
-    print(f"    [Signal B: Token Index] Complete in {elapsed:.2f}s ({len(df_s1)/elapsed:,.0f} queries/sec). Anchors with candidates: {len(candidates_token):,}")
-    return candidates_token
+
+    anchors_with_candidates = sum(
+        1
+        for v in candidates.values()
+        if v
+    )
+
+    print(
+        f"    [Signal B: Token Index] "
+        f"Complete in {elapsed:.2f}s "
+        f"({len(df_s1) / elapsed:,.0f} queries/sec)"
+    )
+
+    print(
+        f"    Anchors with candidates: "
+        f"{anchors_with_candidates:,}"
+    )
+
+    return dict(
+        candidates
+    )
 
 
-# ==============================================================================
-# 4. SIGNAL C: PHYSICAL ADDRESS NUMBER CO-OCCURRENCE
-# ==============================================================================
+# =============================================================================
+# SIGNAL C
+# PHYSICAL ADDRESS NUMBER CO-OCCURRENCE
+# =============================================================================
 
 def generate_address_number_candidates(
     df_s1: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_n_addr: int = 8,
     max_num_postings: int = 2000
-) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    Builds inverted index on address numbers and retrieves candidate pairs sharing exact physical premise numbers.
-    Returns: {s1_id: [(target_id, score), ...]}
-    """
-    print(f"    [Signal C: Address Numbers] Indexing physical address numbers on {len(df_targets):,} targets...")
+):
+
+    print(
+        f"    [Signal C: Address Numbers] "
+        f"Indexing physical address numbers on "
+        f"{len(df_targets):,} targets..."
+    )
+
+    inverted_index = defaultdict(list)
+
+    target_ids = (
+        df_targets["entity_id"]
+        .astype(str)
+        .tolist()
+    )
+
+    # -------------------------------------------------------------------------
+    # BUILD NUMBER INDEX
+    # -------------------------------------------------------------------------
+
+    for idx, row in df_targets.iterrows():
+
+        numbers = str(
+            row.get(
+                "address_numbers",
+                ""
+            )
+        ).split()
+
+        numbers = {
+            n
+            for n in numbers
+            if n
+        }
+
+        for number in numbers:
+
+            inverted_index[
+                number
+            ].append(
+                idx
+            )
+
+    # Remove very common numbers
+    for number in list(
+        inverted_index.keys()
+    ):
+
+        if len(
+            inverted_index[number]
+        ) > max_num_postings:
+
+            del inverted_index[number]
+
+    # -------------------------------------------------------------------------
+    # QUERY
+    # -------------------------------------------------------------------------
+
+    print(
+        f"    [Signal C: Address Numbers] "
+        f"Querying {len(df_s1):,} anchors..."
+    )
+
+    candidates = defaultdict(list)
+
     t0 = time.time()
-    
-    target_ids = df_targets['entity_id'].values
-    target_nums = df_targets['address_numbers'].fillna("").values
-    target_names = df_targets['clean_name'].fillna("").values
-    
-    num_index = defaultdict(list)
-    for idx, num_str in enumerate(target_nums):
-        if not num_str:
-            continue
-        nums = [n.strip() for n in num_str.split(",") if n.strip() and len(n.strip()) >= 2]
-        for n in nums:
-            num_index[n].append(idx)
-            
-    filtered_num_index = {k: v for k, v in num_index.items() if len(v) <= max_num_postings}
-    
-    s1_ids = df_s1['entity_id'].values
-    s1_nums = df_s1['address_numbers'].fillna("").values
-    s1_names = df_s1['clean_name'].fillna("").values
-    
-    candidates_addr = defaultdict(list)
-    print(f"    [Signal C: Address Numbers] Querying {len(df_s1):,} anchors...")
-    
-    for s1_idx, num_str in enumerate(s1_nums):
-        s1_id = s1_ids[s1_idx]
-        if not num_str:
-            continue
-            
-        nums = [n.strip() for n in num_str.split(",") if n.strip() and n.strip() in filtered_num_index]
-        if not nums:
-            continue
-            
-        s1_name_words = set(s1_names[s1_idx].split())
-        
-        target_hits = defaultdict(float)
-        for n in nums:
-            postings = filtered_num_index[n]
-            for t_idx in postings:
-                # Require at least 1 common character 2-gram or first-letter match to avoid random number collisions
-                t_name = target_names[t_idx]
-                if s1_name_words and set(t_name.split()) & s1_name_words:
-                    target_hits[t_idx] += 1.0
-                elif len(s1_names[s1_idx]) > 0 and len(t_name) > 0 and s1_names[s1_idx][0] == t_name[0]:
-                    target_hits[t_idx] += 0.5
-                else:
-                    target_hits[t_idx] += 0.25
-                    
-        if not target_hits:
-            continue
-            
-        sorted_hits = sorted(target_hits.items(), key=lambda x: x[1], reverse=True)[:top_n_addr]
-        for t_idx, score in sorted_hits:
-            candidates_addr[s1_id].append((target_ids[t_idx], float(score)))
-            
+
+    for _, row in df_s1.iterrows():
+
+        s1_id = str(
+            row["entity_id"]
+        )
+
+        numbers = str(
+            row.get(
+                "address_numbers",
+                ""
+            )
+        ).split()
+
+        numbers = {
+            n
+            for n in numbers
+            if n
+        }
+
+        scores = defaultdict(float)
+
+        for number in numbers:
+
+            postings = inverted_index.get(
+                number,
+                []
+            )
+
+            for target_idx in postings:
+
+                scores[target_idx] += 1.0
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_n_addr]
+
+        candidates[s1_id] = [
+            (
+                target_ids[idx],
+                float(score)
+            )
+            for idx, score in ranked
+        ]
+
     elapsed = time.time() - t0
-    print(f"    [Signal C: Address Numbers] Complete in {elapsed:.2f}s ({len(df_s1)/elapsed:,.0f} queries/sec). Anchors with candidates: {len(candidates_addr):,}")
-    return candidates_addr
+
+    anchors_with_candidates = sum(
+        1
+        for v in candidates.values()
+        if v
+    )
+
+    print(
+        f"    [Signal C: Address Numbers] "
+        f"Complete in {elapsed:.2f}s "
+        f"({len(df_s1) / elapsed:,.0f} queries/sec)"
+    )
+
+    print(
+        f"    Anchors with candidates: "
+        f"{anchors_with_candidates:,}"
+    )
+
+    return dict(
+        candidates
+    )
 
 
-# ==============================================================================
-# 5. CANDIDATE UNION, SCORING & TOP-K SELECTION
-# ==============================================================================
+# =============================================================================
+# UNION + RANK + TOP-K
+# =============================================================================
 
 def union_and_rank_candidates(
-    all_s1_ids: List[str],
-    candidates_tfidf: Dict[str, List[Tuple[str, float]]],
-    candidates_token: Dict[str, List[Tuple[str, float]]],
-    candidates_addr: Dict[str, List[Tuple[str, float]]],
-    k: int = 15
-) -> Dict[str, List[str]]:
-    """
-    Unions candidates from all signals, scores them using a composite priority metric, and slices Top-K.
-    Returns: {s1_id: [target_id_1, target_id_2, ...]}
-    """
+    s1_ids,
+    candidates_tfidf,
+    candidates_token,
+    candidates_addr,
+    k: int = 20
+):
+
     final_candidates = {}
-    
-    for s1_id in all_s1_ids:
-        candidate_scores = defaultdict(float)
-        
-        # 1. Signal A: TF-IDF Score
-        for tid, score in candidates_tfidf.get(s1_id, []):
-            candidate_scores[tid] += score * 1.0
-            
-        # 2. Signal B: Token Match Score
-        for tid, score in candidates_token.get(s1_id, []):
-            candidate_scores[tid] += score * 0.35
-            
-        # 3. Signal C: Address Number Match Score
-        for tid, score in candidates_addr.get(s1_id, []):
-            candidate_scores[tid] += score * 0.25
-            
-        if not candidate_scores:
-            final_candidates[s1_id] = []
-            continue
-            
-        # Sort by composite score descending and take top-K
-        sorted_candidates = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)[:k]
-        final_candidates[s1_id] = [tid for tid, _ in sorted_candidates]
-        
+
+    # Signal weights
+    WEIGHT_A = 1.0
+    WEIGHT_B = 0.35
+    WEIGHT_C = 0.25
+
+    for s1_id in s1_ids:
+
+        scores = defaultdict(float)
+
+        # ---------------------------------------------------------------------
+        # SIGNAL A
+        # ---------------------------------------------------------------------
+
+        for target_id, score in candidates_tfidf.get(
+            s1_id,
+            []
+        ):
+
+            scores[
+                target_id
+            ] += WEIGHT_A * float(score)
+
+        # ---------------------------------------------------------------------
+        # SIGNAL B
+        # ---------------------------------------------------------------------
+
+        for target_id, score in candidates_token.get(
+            s1_id,
+            []
+        ):
+
+            scores[
+                target_id
+            ] += WEIGHT_B * float(score)
+
+        # ---------------------------------------------------------------------
+        # SIGNAL C
+        # ---------------------------------------------------------------------
+
+        for target_id, score in candidates_addr.get(
+            s1_id,
+            []
+        ):
+
+            scores[
+                target_id
+            ] += WEIGHT_C * float(score)
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        final_candidates[s1_id] = [
+            target_id
+            for target_id, _ in ranked[:k]
+        ]
+
     return final_candidates
 
 
-# ==============================================================================
-# 6. EVALUATION METRICS FOR HYPERPARAMETER TUNING
-# ==============================================================================
+# =============================================================================
+# CANDIDATE RECALL EVALUATION
+# =============================================================================
 
 def evaluate_candidate_recall(
-    candidate_dict: Dict[str, List[str]],
-    ground_truth_dict: Dict[str, Set[str]],
-    total_s1_count: int,
-    total_target_count: int
-) -> dict:
-    """
-    Evaluates candidate recall, total pairs, average candidates per entity, and reduction ratio.
-    """
-    total_true_matches = sum(len(matches) for matches in ground_truth_dict.values())
+    candidate_dict,
+    ground_truth_dict,
+    total_s1_count,
+    total_target_count
+):
+
+    total_true_matches = 0
     found_true_matches = 0
-    total_candidate_pairs = 0
-    singletons_correct = 0
-    singletons_total = 0
-    
-    for s1_id, true_matches in ground_truth_dict.items():
-        candidates = set(candidate_dict.get(s1_id, []))
-        total_candidate_pairs += len(candidates)
-        
-        if len(true_matches) == 0:
-            singletons_total += 1
-            if len(candidates) == 0:
-                singletons_correct += 1
-        else:
-            hits = len(true_matches & candidates)
-            found_true_matches += hits
-            
-    recall = found_true_matches / total_true_matches if total_true_matches > 0 else 0.0
-    avg_candidates = total_candidate_pairs / total_s1_count if total_s1_count > 0 else 0.0
-    
-    total_search_space = total_s1_count * total_target_count
-    reduction_ratio = 1.0 - (total_candidate_pairs / total_search_space) if total_search_space > 0 else 1.0
-    
+
+    for s1_id, true_targets in ground_truth_dict.items():
+
+        true_targets = set(
+            true_targets
+        )
+
+        candidate_targets = set(
+            candidate_dict.get(
+                s1_id,
+                []
+            )
+        )
+
+        total_true_matches += len(
+            true_targets
+        )
+
+        found_true_matches += len(
+            true_targets
+            & candidate_targets
+        )
+
+    recall = (
+        found_true_matches / total_true_matches
+        if total_true_matches > 0
+        else 0.0
+    )
+
     return {
-        "candidate_recall": recall,
-        "found_true_matches": found_true_matches,
+        "total_s1": total_s1_count,
+        "total_targets": total_target_count,
         "total_true_matches": total_true_matches,
-        "total_candidate_pairs": total_candidate_pairs,
-        "avg_candidates_per_entity": avg_candidates,
-        "reduction_ratio": reduction_ratio,
-        "singletons_total": singletons_total
+        "found_true_matches": found_true_matches,
+        "candidate_recall": recall
     }
