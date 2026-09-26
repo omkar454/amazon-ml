@@ -1222,7 +1222,7 @@ def generate_address_number_candidates(
     # BUILD NUMBER INDEX
     # -------------------------------------------------------------------------
 
-    for idx, row in df_targets.iterrows():
+    for idx, row in df_targets.reset_index(drop=True).iterrows():
 
         numbers = str(
             row.get(
