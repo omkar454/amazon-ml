@@ -259,35 +259,59 @@ def compute_pair_features(
     ]
 
 
-# =============================================================================
-# DATA LOADING & PRE-PROCESSING
-# =============================================================================
+def find_source_file(directory: str, prefix: str) -> Optional[str]:
+    """Find source file supporting .tsv, .parquet, and _normalized variants."""
+    candidates = [
+        f"{prefix}.tsv",
+        f"{prefix}.parquet",
+        f"{prefix}_normalized.tsv",
+        f"{prefix}_normalized.parquet",
+    ]
+    for c in candidates:
+        full_p = os.path.join(directory, c)
+        if os.path.isfile(full_p):
+            return full_p
+    return None
+
 
 def load_source_records(file_path: str) -> Dict[str, Dict[str, Any]]:
     """
-    Load and pre-clean source TSV files into memory.
-    Returns: { entity_id: {'clean_name', 'core_name', 'clean_addr', 'nums', 'full'} }
+    Load and pre-clean source TSV or Parquet files into memory.
+    Supports both raw schema ('business_name', 'business_address')
+    and normalized schema ('clean_name', 'clean_name_full', 'clean_address', 'address_numbers').
+    Returns: { entity_id: {'name', 'core', 'addr', 'nums', 'full'} }
     """
     records = {}
-    if not os.path.isfile(file_path):
+    if not file_path or not os.path.isfile(file_path):
         logger.warning(f"File not found: {file_path}")
         return records
 
     logger.info(f"Loading and pre-processing: {file_path}")
-    df = pd.read_csv(file_path, sep="\t", dtype=str, keep_default_na=False)
-    
+    if file_path.endswith(".parquet"):
+        df = pd.read_parquet(file_path)
+    else:
+        df = pd.read_csv(file_path, sep="\t", dtype=str, keep_default_na=False)
+
     for _, row in df.iterrows():
-        eid = row.get("entity_id", "").strip()
+        eid = str(row.get("entity_id", "")).strip()
         if not eid:
             continue
         
-        raw_name = row.get("business_name", "")
-        raw_addr = row.get("business_address", "")
+        # Check normalized columns first, then raw columns
+        raw_name = row.get("clean_name_full") or row.get("clean_name") or row.get("business_name") or ""
+        raw_addr = row.get("clean_address") or row.get("business_address") or ""
         
         clean_n = clean_text(raw_name)
-        core_n = get_core_name(clean_n)
+        core_n = clean_text(row.get("clean_name") or get_core_name(clean_n))
         clean_a = clean_text(raw_addr)
-        nums = extract_numbers(raw_name + " " + raw_addr)
+        
+        # Extract numbers or use pre-extracted address_numbers if available
+        if "address_numbers" in row and row["address_numbers"]:
+            raw_nums = str(row["address_numbers"]).split(",")
+            nums = {n.strip().lstrip("0") for n in raw_nums if n.strip().lstrip("0")}
+        else:
+            nums = extract_numbers(clean_n + " " + clean_a)
+            
         full = (clean_n + " " + clean_a).strip()
         
         records[eid] = {
@@ -356,13 +380,20 @@ def build_or_load_model(
     pairs and hard negative candidate pairs generated across sources.
     Returns: (trained_model, best_threshold)
     """
+    # Locate files supporting .tsv and .parquet
     gt_file = os.path.join(train_dir, "train_ground_truth.tsv")
-    s1_file = os.path.join(train_dir, "train_source1.tsv")
-    s2_file = os.path.join(train_dir, "train_source2.tsv")
-    s3_file = os.path.join(train_dir, "train_source3.tsv")
+    if not os.path.isfile(gt_file):
+        # Check parent/sibling dataset/train directory
+        alt_gt = os.path.join(os.path.dirname(train_dir), "train", "train_ground_truth.tsv")
+        if os.path.isfile(alt_gt):
+            gt_file = alt_gt
 
-    if not all(os.path.isfile(f) for f in [gt_file, s1_file, s2_file, s3_file]):
-        logger.warning("Training files not found in train_dir. Falling back to default heuristics/model.")
+    s1_file = find_source_file(train_dir, "train_source1")
+    s2_file = find_source_file(train_dir, "train_source2")
+    s3_file = find_source_file(train_dir, "train_source3")
+
+    if not gt_file or not os.path.isfile(gt_file) or not s1_file or not s2_file or not s3_file:
+        logger.warning(f"Training files not fully found in {train_dir}. Falling back to pre-configured decision model.")
         # Fallback pre-configured lightweight model
         model = lgb.LGBMClassifier(
             n_estimators=200,
@@ -370,7 +401,7 @@ def build_or_load_model(
             num_leaves=31,
             random_state=42
         )
-        return model, 0.78
+        return model, 0.75
 
     logger.info("Loading training records to build LightGBM model...")
     s1_records = load_source_records(s1_file)
@@ -589,17 +620,19 @@ def run_matching_pipeline(
     logger.info("=" * 70)
 
     # 1. Load S1 reference entities in test set (to guarantee 100% S1 row coverage)
-    s1_test_file = os.path.join(test_dir, "test_source1.tsv")
-    s2_test_file = os.path.join(test_dir, "test_source2.tsv")
-    s3_test_file = os.path.join(test_dir, "test_source3.tsv")
+    s1_test_file = find_source_file(test_dir, "test_source1")
+    s2_test_file = find_source_file(test_dir, "test_source2")
+    s3_test_file = find_source_file(test_dir, "test_source3")
 
-    if not os.path.isfile(s1_test_file):
-        raise FileNotFoundError(f"Required test file not found: {s1_test_file}")
+    if not s1_test_file or not os.path.isfile(s1_test_file):
+        raise FileNotFoundError(f"Required test source 1 file not found in: {test_dir}")
 
     s1_records = load_source_records(s1_test_file)
     target_records = {}
-    target_records.update(load_source_records(s2_test_file))
-    target_records.update(load_source_records(s3_test_file))
+    if s2_test_file:
+        target_records.update(load_source_records(s2_test_file))
+    if s3_test_file:
+        target_records.update(load_source_records(s3_test_file))
 
     # 2. Build or Load LightGBM Matcher
     if train_dir and os.path.isdir(train_dir):
