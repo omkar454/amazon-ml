@@ -8,8 +8,15 @@ dataset/
 # Large Output Submissions & Archives
 *.zip
 *.tar.gz
-**/output/candidate_pairs.tsv
-**/output/matching_results.tsv
+**/output/*.tsv
+output/
+
+# Large Embeddings & Memmaps
+**/embeddings/
+embeddings/
+*.mmap
+*.dat
+*.parquet
 
 # Python Bytecode and Cache
 __pycache__/
