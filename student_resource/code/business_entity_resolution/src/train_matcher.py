@@ -22,10 +22,8 @@ import lightgbm as lgb
 
 from blocking import (
     country_partition,
-    generate_3gram_tfidf_candidates,
-    generate_token_candidates,
-    generate_address_number_candidates,
-    union_and_rank_candidates
+    build_target_blocking_index,
+    query_blocking_index_chunk
 )
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -125,20 +123,18 @@ def build_training_dataset(
         s1_sub = part["s1"]
         tgt_sub = part["targets"]
         
+        if len(tgt_sub) == 0:
+            continue
+            
         print(f"\n  --- Partition: {country} (S1: {len(s1_sub):,}, Targets: {len(tgt_sub):,}) ---")
-        cands_tfidf = generate_3gram_tfidf_candidates(s1_sub, tgt_sub, top_n_tfidf=10, min_similarity=0.20)
-        cands_token = generate_token_candidates(s1_sub, tgt_sub, top_n_token=10)
-        cands_addr = generate_address_number_candidates(s1_sub, tgt_sub, top_n_addr=10)
+        index_bundle = build_target_blocking_index(tgt_sub)
+        s1_ids = s1_sub["entity_id"].values
+        s1_names = s1_sub["clean_name"].values
+        s1_nums = s1_sub["address_numbers"].values if "address_numbers" in s1_sub.columns else np.array([""] * len(s1_sub))
         
-        part_cands = union_and_rank_candidates(
-            list(s1_sub["entity_id"]),
-            cands_tfidf,
-            cands_token,
-            cands_addr,
-            k=15
-        )
+        cands_results = query_blocking_index_chunk(s1_ids, s1_names, s1_nums, index_bundle, k=15)
         
-        for s1_id, c_list in part_cands.items():
+        for s1_id, c_list in cands_results:
             true_tgts = ground_truth_dict.get(s1_id, set())
             neg_count = 0
             for c_id in c_list:
