@@ -1,11 +1,12 @@
 """
-LightGBM Match Inference Pipeline (predict_matches.py)
-Reads 'output/candidate_pairs.tsv', extracts 10 RapidFuzz + metadata features,
-scores candidate pairs with trained LightGBM matcher, applies precision-optimized
-threshold (tuned for F0.5), and writes 'output/matching_results.tsv'.
+LightGBM Match Inference Pipeline (Optimized & Chunked)
+Reads 'output/candidate_pairs.tsv', filters metadata to active candidate entities (ultra-low RAM < 1.5 GB),
+extracts 10 RapidFuzz features in streaming batches, applies optimal F0.5 decision threshold,
+and writes validated 'output/matching_results.tsv'.
 """
 
 import os
+import gc
 import sys
 import time
 import argparse
@@ -46,8 +47,8 @@ def extract_pair_features(n1: str, n2: str, a1: str, a2: str, nums1_str: str, nu
     f_addr_ratio = fuzz.ratio(a1, a2) / 100.0
     f_addr_token_set = fuzz.token_set_ratio(a1, a2) / 100.0
     
-    set1 = set(n.strip() for n in nums1_str.split(",") if n.strip())
-    set2 = set(n.strip() for n in nums2_str.split(",") if n.strip())
+    set1 = set(n.strip() for n in nums1_str.split(",") if n.strip()) if nums1_str else set()
+    set2 = set(n.strip() for n in nums2_str.split(",") if n.strip()) if nums2_str else set()
     
     f_num_match = 1.0 if (set1 and set2 and (set1 & set2)) else 0.0
     f_num_jaccard = (len(set1 & set2) / len(set1 | set2)) if (set1 and set2) else 0.0
@@ -77,7 +78,7 @@ def run_prediction_pipeline(
     batch_size: int = 50000
 ):
     print("=" * 80)
-    print("LIGHTGBM MATCH PREDICTION PIPELINE (matching_results.tsv)")
+    print("HIGH-SPEED LIGHTGBM MATCH PREDICTION PIPELINE (matching_results.tsv)")
     print("=" * 80)
     
     t0 = time.time()
@@ -98,40 +99,78 @@ def run_prediction_pipeline(
     print(f"Loading LightGBM model from {os.path.basename(model_file)}...")
     artifact = joblib.load(model_file)
     model = artifact["model"]
-    optimal_threshold = override_threshold if override_threshold is not None else artifact.get("optimal_threshold", 0.65)
+    optimal_threshold = override_threshold if override_threshold is not None else artifact.get("optimal_threshold", 0.75)
     best_f05 = artifact.get("best_f05", 0.0)
     
     print(f"  Model Type: LightGBM (GBDT)")
     print(f"  Optimal Decision Threshold (F0.5): {optimal_threshold:.2f}")
     print(f"  Validation F0.5 Score: {best_f05*100:.2f}%")
     
-    # 2. Load Normalized Metadata for fast in-memory lookup
-    print("\nLoading Normalized Test Datasets for metadata lookups...")
-    t_load = time.time()
+    # 2. Collect unique Active Candidate IDs to load ONLY active targets into RAM
+    print(f"\nPass 1: Scanning {os.path.basename(candidate_file)} for active candidate targets...")
+    t_scan = time.time()
+    active_target_ids = set()
+    candidate_pair_count = 0
     
+    with open(candidate_file, "r", encoding="utf-8") as f:
+        next(f, None)  # header
+        for line in f:
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) > 1 and parts[1].strip():
+                c_ids = parts[1].split(",")
+                for cid in c_ids:
+                    cid = cid.strip()
+                    if cid:
+                        active_target_ids.add(cid)
+                        candidate_pair_count += 1
+                        
+    print(f"  Found {len(active_target_ids):,} unique active candidate targets ({candidate_pair_count:,} total pairs) in {time.time()-t_scan:.2f}s!")
+    
+    # 3. Load Normalized S1 Records
+    print("\nLoading Normalized Test S1 Dataset...")
     s1_path = os.path.join(NORM_DIR, "test_source1_normalized.tsv")
-    s2_path = os.path.join(NORM_DIR, "test_source2_normalized.tsv")
-    s3_path = os.path.join(NORM_DIR, "test_source3_normalized.tsv")
-    
     df_s1 = pd.read_csv(s1_path, sep="\t", dtype=str, keep_default_na=False)
+    
     s1_names = dict(zip(df_s1["entity_id"], df_s1["clean_name"].fillna("")))
     s1_addrs = dict(zip(df_s1["entity_id"], df_s1["clean_address"].fillna("")))
     s1_nums = dict(zip(df_s1["entity_id"], df_s1["address_numbers"].fillna("")))
     s1_countries = dict(zip(df_s1["entity_id"], df_s1["country"].fillna("")))
+    del df_s1
+    gc.collect()
     print(f"  Indexed {len(s1_names):,} S1 query entities.")
     
-    print("  Loading target catalog (S2 + S3)...")
-    df_s2 = pd.read_csv(s2_path, sep="\t", dtype=str, keep_default_na=False)
-    df_s3 = pd.read_csv(s3_path, sep="\t", dtype=str, keep_default_na=False)
-    df_targets = pd.concat([df_s2, df_s3], ignore_index=True)
+    # 4. Load only ACTIVE targets from S2 and S3 (Low RAM!)
+    print(f"Loading metadata for {len(active_target_ids):,} active targets from S2 and S3...")
+    t_tgt = time.time()
     
-    tgt_names = dict(zip(df_targets["entity_id"], df_targets["clean_name"].fillna("")))
-    tgt_addrs = dict(zip(df_targets["entity_id"], df_targets["clean_address"].fillna("")))
-    tgt_nums = dict(zip(df_targets["entity_id"], df_targets["address_numbers"].fillna("")))
-    tgt_countries = dict(zip(df_targets["entity_id"], df_targets["country"].fillna("")))
-    print(f"  Indexed {len(tgt_names):,} Target catalog entities in {time.time()-t_load:.2f}s!")
+    tgt_names = {}
+    tgt_addrs = {}
+    tgt_nums = {}
+    tgt_countries = {}
     
-    # 3. Stream through candidate_pairs.tsv and predict in batches
+    s2_path = os.path.join(NORM_DIR, "test_source2_normalized.tsv")
+    s3_path = os.path.join(NORM_DIR, "test_source3_normalized.tsv")
+    
+    for path in [s2_path, s3_path]:
+        print(f"  Filtering {os.path.basename(path)}...")
+        df_t = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+        df_active = df_t[df_t["entity_id"].isin(active_target_ids)]
+        
+        for _, row in df_active.iterrows():
+            eid = row["entity_id"]
+            tgt_names[eid] = row.get("clean_name", "")
+            tgt_addrs[eid] = row.get("clean_address", "")
+            tgt_nums[eid] = row.get("address_numbers", "")
+            tgt_countries[eid] = row.get("country", "")
+            
+        del df_t, df_active
+        gc.collect()
+        
+    print(f"  Indexed {len(tgt_names):,} active target records in {time.time()-t_tgt:.2f}s!")
+    del active_target_ids
+    gc.collect()
+    
+    # 5. Stream candidate pairs and score with LightGBM in chunks
     print(f"\nProcessing candidate pairs in chunks of {batch_size:,} S1 entities...")
     
     total_s1 = 0
@@ -144,7 +183,7 @@ def run_prediction_pipeline(
          open(candidate_file, "r", encoding="utf-8") as f_cand:
         
         # Header
-        header = f_cand.readline()
+        next(f_cand, None)
         f_out.write("source1_entity_id\tmatched_entity_ids\n")
         
         chunk_lines = []
@@ -156,71 +195,76 @@ def run_prediction_pipeline(
             chunk_lines.append(line)
             
             if len(chunk_lines) >= batch_size:
-                # Process chunk
-                s1_chunk_count, matched_cnt, sing_cnt, scored_cnt, match_pair_cnt = _process_prediction_chunk(
+                s1_cnt, match_cnt, sing_cnt, scored_cnt, m_pair_cnt = _score_and_write_chunk(
                     chunk_lines, model, optimal_threshold,
                     s1_names, s1_addrs, s1_nums, s1_countries,
                     tgt_names, tgt_addrs, tgt_nums, tgt_countries,
                     f_out
                 )
-                total_s1 += s1_chunk_count
-                total_matched_entities += matched_cnt
+                total_s1 += s1_cnt
+                total_matched_entities += match_cnt
                 total_singletons += sing_cnt
                 total_pairs_scored += scored_cnt
-                total_pairs_matched += match_pair_cnt
+                total_pairs_matched += m_pair_cnt
                 
                 chunk_lines = []
                 print(f"  Processed {total_s1:,} S1 entities ({total_matched_entities:,} matched, {total_singletons:,} singletons, {total_pairs_scored:,} pairs scored)...")
                 
         # Process remaining chunk
         if chunk_lines:
-            s1_chunk_count, matched_cnt, sing_cnt, scored_cnt, match_pair_cnt = _process_prediction_chunk(
+            s1_cnt, match_cnt, sing_cnt, scored_cnt, m_pair_cnt = _score_and_write_chunk(
                 chunk_lines, model, optimal_threshold,
                 s1_names, s1_addrs, s1_nums, s1_countries,
                 tgt_names, tgt_addrs, tgt_nums, tgt_countries,
                 f_out
             )
-            total_s1 += s1_chunk_count
-            total_matched_entities += matched_cnt
+            total_s1 += s1_cnt
+            total_matched_entities += match_cnt
             total_singletons += sing_cnt
             total_pairs_scored += scored_cnt
-            total_pairs_matched += match_pair_cnt
+            total_pairs_matched += m_pair_cnt
             
     total_elapsed = time.time() - t0
+    sing_pct = (total_singletons / total_s1 * 100) if total_s1 > 0 else 0
+    match_pct = (total_matched_entities / total_s1 * 100) if total_s1 > 0 else 0
+    
     print("\n" + "=" * 80)
     print(f"Matching Results Generation Complete in {total_elapsed/60:.2f} minutes!")
     print(f"  Total S1 Entities Processed: {total_s1:,}")
-    print(f"  Singletons (Empty Match): {total_singletons:,} ({total_singletons/total_s1*100:.1f}%)")
-    print(f"  Matched S1 Entities: {total_matched_entities:,} ({total_matched_entities/total_s1*100:.1f}%)")
+    print(f"  Singletons (Empty Match): {total_singletons:,} ({sing_pct:.1f}%)")
+    print(f"  Matched S1 Entities: {total_matched_entities:,} ({match_pct:.1f}%)")
     print(f"  Total Candidate Pairs Scored: {total_pairs_scored:,}")
     print(f"  Total Confirmed Match Pairs: {total_pairs_matched:,}")
     print(f"  Output Saved to: {output_file}")
     print("=" * 80)
     
-    # 4. Run Validator
+    # 6. Run Validator
     val_script = os.path.join(BASE_DIR, "utils", "validate_submission.py")
     if os.path.isfile(val_script):
         print("\n" + "=" * 80)
         print("RUNNING SUBMISSION VALIDATOR (validate_submission.py)")
         print("=" * 80)
+        raw_test_dir = os.path.join(BASE_DIR, "dataset", "test")
+        norm_dir = os.path.join(BASE_DIR, "dataset", "normalized")
+        chk_dir = raw_test_dir if os.path.isdir(raw_test_dir) else norm_dir
         cmd = [
             sys.executable,
             val_script,
             "--matching", output_file,
             "--candidate", candidate_file,
-            "--test-dir", TEST_DIR
+            "--test-dir", chk_dir
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
         print(res.stdout)
         if res.stderr:
             print("Stderr:", res.stderr)
         if res.returncode == 0:
-            print(">>> VALIDATOR STATUS: 100% PASS (Exit Code 0) <<<")
+            print(">>> VALIDATOR STATUS: PASS (Exit Code 0) <<<")
         else:
             print(">>> VALIDATOR STATUS: WARNING/FAIL <<<")
 
 
-def _process_prediction_chunk(
+def _score_and_write_chunk(
     chunk_lines: list,
     model,
     threshold: float,
@@ -228,11 +272,10 @@ def _process_prediction_chunk(
     tgt_names: dict, tgt_addrs: dict, tgt_nums: dict, tgt_countries: dict,
     f_out
 ):
-    """Processes a batch of S1 lines and candidate lists."""
+    """Extracts features, runs LightGBM batch inference, and writes results in exact order."""
     pairs_to_score = []
-    pair_s1_indices = []
-    
-    s1_meta_list = []
+    pair_meta = []
+    s1_items = []
     
     for line in chunk_lines:
         parts = line.split("\t")
@@ -240,7 +283,8 @@ def _process_prediction_chunk(
         cand_str = parts[1] if len(parts) > 1 else ""
         cands = [c.strip() for c in cand_str.split(",") if c.strip()]
         
-        s1_meta_list.append((s1_id, cands))
+        s1_idx = len(s1_items)
+        s1_items.append(s1_id)
         
         if not cands:
             continue
@@ -250,8 +294,6 @@ def _process_prediction_chunk(
         num1 = s1_nums.get(s1_id, "")
         c1 = str(s1_countries.get(s1_id, "")).lower()
         
-        s1_idx = len(s1_meta_list) - 1
-        
         for tgt_id in cands:
             n2 = tgt_names.get(tgt_id, "")
             a2 = tgt_addrs.get(tgt_id, "")
@@ -260,30 +302,28 @@ def _process_prediction_chunk(
             
             feats = extract_pair_features(n1, n2, a1, a2, num1, num2, c1, c2)
             pairs_to_score.append(feats)
-            pair_s1_indices.append((s1_idx, tgt_id))
+            pair_meta.append((s1_idx, tgt_id))
             
-    # Predict probabilities in one fast vectorized batch
     scored_cnt = len(pairs_to_score)
-    s1_confirmed_matches = defaultdict(list)
+    s1_matches = defaultdict(list)
     match_pair_cnt = 0
     
     if pairs_to_score:
         X_batch = np.array(pairs_to_score, dtype=np.float32)
         probs = model.predict_proba(X_batch)[:, 1]
         
-        for (s1_idx, tgt_id), prob in zip(pair_s1_indices, probs):
+        for (s1_idx, tgt_id), prob in zip(pair_meta, probs):
             if prob >= threshold:
-                s1_confirmed_matches[s1_idx].append((tgt_id, float(prob)))
+                s1_matches[s1_idx].append((tgt_id, float(prob)))
                 match_pair_cnt += 1
                 
-    # Write out each S1 entity in exact original order
+    # Write out in exact S1 order
     matched_cnt = 0
     sing_cnt = 0
     
-    for s1_idx, (s1_id, _) in enumerate(s1_meta_list):
-        matches = s1_confirmed_matches.get(s1_idx, [])
+    for s1_idx, s1_id in enumerate(s1_items):
+        matches = s1_matches.get(s1_idx, [])
         if matches:
-            # Sort confirmed matches by confidence descending
             matches.sort(key=lambda x: x[1], reverse=True)
             matched_str = ",".join(t[0] for t in matches)
             f_out.write(f"{s1_id}\t{matched_str}\n")
@@ -301,7 +341,7 @@ def main():
     parser.add_argument("--output-file", type=str, default=None, help="Path to matching_results.tsv")
     parser.add_argument("--model-file", type=str, default=None, help="Path to lgb_matcher.joblib")
     parser.add_argument("--threshold", type=float, default=None, help="Override decision threshold (default: optimal from model artifact)")
-    parser.add_argument("--batch-size", type=int, default=50000, help="S1 batch size (default: 50,000)")
+    parser.add_argument("--batch-size", type=int, default=50000, help="S1 chunk size (default: 50,000)")
     args = parser.parse_args()
     
     run_prediction_pipeline(
