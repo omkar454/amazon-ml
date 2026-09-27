@@ -70,6 +70,32 @@ def extract_pair_features(n1: str, n2: str, a1: str, a2: str, nums1_str: str, nu
     ]
 
 
+def load_normalized_tsv_records(file_path: str, active_ids: set = None):
+    """Ultra-fast streaming loader for normalized TSV files with optional ID filtering (compact tuple dict)."""
+    meta = {}
+    with open(file_path, "r", encoding="utf-8") as f:
+        header_line = next(f, None)
+        if not header_line:
+            return meta
+        header = header_line.rstrip("\r\n").split("\t")
+        id_idx = header.index("entity_id") if "entity_id" in header else 0
+        name_idx = header.index("clean_name") if "clean_name" in header else 1
+        addr_idx = header.index("clean_address") if "clean_address" in header else 3
+        num_idx = header.index("address_numbers") if "address_numbers" in header else 4
+        ctry_idx = header.index("country") if "country" in header else 6
+        
+        for line in f:
+            parts = line.rstrip("\r\n").split("\t")
+            eid = parts[id_idx]
+            if active_ids is None or eid in active_ids:
+                name = parts[name_idx] if name_idx < len(parts) else ""
+                addr = parts[addr_idx] if addr_idx < len(parts) else ""
+                nums = parts[num_idx] if num_idx < len(parts) else ""
+                ctry = parts[ctry_idx] if ctry_idx < len(parts) else ""
+                meta[eid] = (name, addr, nums, ctry.lower())
+    return meta
+
+
 def run_prediction_pipeline(
     candidate_file: str = None,
     output_file: str = None,
@@ -128,45 +154,27 @@ def run_prediction_pipeline(
     
     # 3. Load Normalized S1 Records
     print("\nLoading Normalized Test S1 Dataset...")
+    t_s1 = time.time()
     s1_path = os.path.join(NORM_DIR, "test_source1_normalized.tsv")
-    df_s1 = pd.read_csv(s1_path, sep="\t", dtype=str, keep_default_na=False)
-    
-    s1_names = dict(zip(df_s1["entity_id"], df_s1["clean_name"].fillna("")))
-    s1_addrs = dict(zip(df_s1["entity_id"], df_s1["clean_address"].fillna("")))
-    s1_nums = dict(zip(df_s1["entity_id"], df_s1["address_numbers"].fillna("")))
-    s1_countries = dict(zip(df_s1["entity_id"], df_s1["country"].fillna("")))
-    del df_s1
-    gc.collect()
-    print(f"  Indexed {len(s1_names):,} S1 query entities.")
+    s1_meta = load_normalized_tsv_records(s1_path)
+    print(f"  Indexed {len(s1_meta):,} S1 query entities in {time.time()-t_s1:.2f}s.")
     
     # 4. Load only ACTIVE targets from S2 and S3 (Low RAM!)
     print(f"Loading metadata for {len(active_target_ids):,} active targets from S2 and S3...")
     t_tgt = time.time()
-    
-    tgt_names = {}
-    tgt_addrs = {}
-    tgt_nums = {}
-    tgt_countries = {}
+    tgt_meta = {}
     
     s2_path = os.path.join(NORM_DIR, "test_source2_normalized.tsv")
     s3_path = os.path.join(NORM_DIR, "test_source3_normalized.tsv")
     
     for path in [s2_path, s3_path]:
         print(f"  Filtering {os.path.basename(path)}...")
-        df_t = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-        df_active = df_t[df_t["entity_id"].isin(active_target_ids)]
-        
-        for _, row in df_active.iterrows():
-            eid = row["entity_id"]
-            tgt_names[eid] = row.get("clean_name", "")
-            tgt_addrs[eid] = row.get("clean_address", "")
-            tgt_nums[eid] = row.get("address_numbers", "")
-            tgt_countries[eid] = row.get("country", "")
-            
-        del df_t, df_active
+        meta = load_normalized_tsv_records(path, active_target_ids)
+        tgt_meta.update(meta)
+        del meta
         gc.collect()
         
-    print(f"  Indexed {len(tgt_names):,} active target records in {time.time()-t_tgt:.2f}s!")
+    print(f"  Indexed {len(tgt_meta):,} active target records in {time.time()-t_tgt:.2f}s!")
     del active_target_ids
     gc.collect()
     
@@ -197,8 +205,7 @@ def run_prediction_pipeline(
             if len(chunk_lines) >= batch_size:
                 s1_cnt, match_cnt, sing_cnt, scored_cnt, m_pair_cnt = _score_and_write_chunk(
                     chunk_lines, model, optimal_threshold,
-                    s1_names, s1_addrs, s1_nums, s1_countries,
-                    tgt_names, tgt_addrs, tgt_nums, tgt_countries,
+                    s1_meta, tgt_meta,
                     f_out
                 )
                 total_s1 += s1_cnt
@@ -214,8 +221,7 @@ def run_prediction_pipeline(
         if chunk_lines:
             s1_cnt, match_cnt, sing_cnt, scored_cnt, m_pair_cnt = _score_and_write_chunk(
                 chunk_lines, model, optimal_threshold,
-                s1_names, s1_addrs, s1_nums, s1_countries,
-                tgt_names, tgt_addrs, tgt_nums, tgt_countries,
+                s1_meta, tgt_meta,
                 f_out
             )
             total_s1 += s1_cnt
@@ -268,14 +274,16 @@ def _score_and_write_chunk(
     chunk_lines: list,
     model,
     threshold: float,
-    s1_names: dict, s1_addrs: dict, s1_nums: dict, s1_countries: dict,
-    tgt_names: dict, tgt_addrs: dict, tgt_nums: dict, tgt_countries: dict,
+    s1_meta: dict,
+    tgt_meta: dict,
     f_out
 ):
     """Extracts features, runs LightGBM batch inference, and writes results in exact order."""
     pairs_to_score = []
     pair_meta = []
     s1_items = []
+    
+    empty_tuple = ("", "", "", "")
     
     for line in chunk_lines:
         parts = line.split("\t")
@@ -289,17 +297,10 @@ def _score_and_write_chunk(
         if not cands:
             continue
             
-        n1 = s1_names.get(s1_id, "")
-        a1 = s1_addrs.get(s1_id, "")
-        num1 = s1_nums.get(s1_id, "")
-        c1 = str(s1_countries.get(s1_id, "")).lower()
+        n1, a1, num1, c1 = s1_meta.get(s1_id, empty_tuple)
         
         for tgt_id in cands:
-            n2 = tgt_names.get(tgt_id, "")
-            a2 = tgt_addrs.get(tgt_id, "")
-            num2 = tgt_nums.get(tgt_id, "")
-            c2 = str(tgt_countries.get(tgt_id, "")).lower()
-            
+            n2, a2, num2, c2 = tgt_meta.get(tgt_id, empty_tuple)
             feats = extract_pair_features(n1, n2, a1, a2, num1, num2, c1, c2)
             pairs_to_score.append(feats)
             pair_meta.append((s1_idx, tgt_id))

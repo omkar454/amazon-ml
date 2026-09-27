@@ -54,7 +54,7 @@ def read_ids(path):
 
     The header row is skipped and blank lines are ignored.
     """
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8", newline="") as f:
         next(f, None)  # skip header
         return {line.split(DELIM, 1)[0].strip() for line in f if line.strip()}
 
@@ -91,7 +91,10 @@ def load_match_targets(test_dir, warnings):
     return targets
 
 
-def validate_id_list_file(path, expected_header, col_label, required, valid_ids, errors):
+def validate_id_list_file(
+    path, expected_header, col_label, required, valid_ids, errors,
+    store_mapping=True, cross_check_matched=None, mismatch_out=None
+):
     """Validate one results-style TSV (matching or candidate).
 
     Applies the shared formatting rules and appends any problems to ``errors``.
@@ -103,12 +106,12 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
         return None
 
     name = os.path.basename(path)
-    mapping = {}
+    mapping = {} if store_mapping else None
     seen, dup_rows, intra_dupes = set(), set(), set()
     self_matches, wrong_prefix, unknown = set(), set(), set()
     n_rows = empties = 0
 
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8", newline="") as f:
         header = f.readline()
         if not header:
             errors.append(f"{name} is empty.")
@@ -120,7 +123,7 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
                 "write it with df.to_csv(sep='\\t', index=False)."
             )
             return None
-        cols = [c.strip().lower() for c in header.rstrip("\n").split(DELIM)]
+        cols = [c.strip().lower() for c in header.rstrip("\r\n").split(DELIM)]
         if cols != expected_header:
             errors.append(
                 f"{name}: unexpected header {cols}. "
@@ -143,15 +146,28 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
                 dup_rows.add(s1)
             seen.add(s1)
 
-            ids = rest.rstrip("\n").split(",") if rest.strip() else []
+            ids = rest.rstrip("\r\n").split(",") if rest.strip() else []
             if not ids:
                 empties += 1
-                mapping[s1] = set()
+                if store_mapping:
+                    mapping[s1] = set()
+                if cross_check_matched is not None and cross_check_matched.get(s1):
+                    if mismatch_out is not None:
+                        mismatch_out.add(s1)
                 continue
+                
             if len(ids) != len(set(ids)):
                 intra_dupes.add(s1)
             id_set = set(ids)
-            mapping[s1] = id_set
+            if store_mapping:
+                mapping[s1] = id_set
+                
+            if cross_check_matched is not None:
+                m_set = cross_check_matched.get(s1, set())
+                if m_set - id_set:
+                    if mismatch_out is not None:
+                        mismatch_out.add(s1)
+                        
             for mid in id_set:
                 if mid.startswith("S1-"):
                     self_matches.add(mid)
@@ -202,16 +218,11 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
             errors.append(message.format(name=name, ex=examples(offenders), col=col_label))
 
     print(f"  {name}: {n_rows} rows ({empties} empty, {n_rows - empties} non-empty).")
-    return mapping
+    return mapping if store_mapping else True
 
 
 def validate(matching_path, candidate_path, test_dir, check_ids=False):
-    """Validate the submission output(s); return ``(errors, warnings)`` lists.
-
-    ``check_ids`` (``--check-ids``) turns on the optional, memory-heavy check that
-    every matched/candidate ID exists in the test Source-2/3 files. It is off by
-    default so the common run stays fast and light.
-    """
+    """Validate the submission output(s); return ``(errors, warnings)`` lists."""
     errors, warnings = [], []
 
     source1 = os.path.join(test_dir, "test_source1.tsv")
@@ -236,17 +247,19 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
         )
 
     matched = validate_id_list_file(
-        matching_path, MATCHING_HEADER, "matched_entity_ids", required, valid_ids, errors
+        matching_path, MATCHING_HEADER, "matched_entity_ids", required, valid_ids, errors,
+        store_mapping=True
     )
 
-    # candidate_pairs.tsv is optional: if it's absent we skip its checks with a
-    # warning (it's still expected in your final submission zip). A missing
-    # candidate file never fails this run on its own.
-    candidate = None
+    candidate_mismatches = set()
+    candidate_ok = None
     if candidate_path and os.path.isfile(candidate_path):
-        candidate = validate_id_list_file(
+        candidate_ok = validate_id_list_file(
             candidate_path, CANDIDATE_HEADER, "candidate_entity_ids",
             required, valid_ids, errors,
+            store_mapping=False,
+            cross_check_matched=matched,
+            mismatch_out=candidate_mismatches
         )
     elif candidate_path:
         warnings.append(
@@ -256,16 +269,11 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
         )
 
     # Soft check: your final matches should come from your blocking candidates.
-    # A matched ID absent from candidate_pairs.tsv usually means a pipeline bug,
-    # so we warn but never fail on it.
-    if matched is not None and candidate is not None:
-        offenders = {
-            s1 for s1, mids in matched.items() if mids - candidate.get(s1, set())
-        }
-        if offenders:
+    if matched is not None and candidate_ok:
+        if candidate_mismatches:
             warnings.append(
-                f"{len(offenders)} S1 entity(ies) have matched IDs not present in "
-                f"candidate_pairs.tsv, e.g. {examples(offenders)}. Final matches "
+                f"{len(candidate_mismatches)} S1 entity(ies) have matched IDs not present in "
+                f"candidate_pairs.tsv, e.g. {examples(candidate_mismatches)}. Final matches "
                 "normally come from your blocking candidates — double-check these."
             )
 

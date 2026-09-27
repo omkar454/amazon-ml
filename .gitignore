@@ -11,6 +11,9 @@ dataset/
 **/output/*.tsv
 output/
 
+# Models
+models/
+
 # Large Embeddings & Memmaps
 **/embeddings/
 embeddings/

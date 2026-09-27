@@ -13,7 +13,8 @@ import argparse
 import subprocess
 import joblib
 import numpy as np
-import pandas as pd
+import lightgbm as lgb
+import sklearn
 from collections import defaultdict
 from rapidfuzz import fuzz
 
@@ -79,6 +80,32 @@ def extract_pair_features(
     ]
 
 
+def load_normalized_tsv_records(file_path: str, active_ids: set = None):
+    """Ultra-fast streaming loader for normalized TSV files with optional ID filtering (compact tuple dict)."""
+    meta = {}
+    with open(file_path, "r", encoding="utf-8", newline="") as f:
+        header_line = next(f, None)
+        if not header_line:
+            return meta
+        header = header_line.rstrip("\r\n").split("\t")
+        id_idx = header.index("entity_id") if "entity_id" in header else 0
+        name_idx = header.index("clean_name") if "clean_name" in header else 1
+        addr_idx = header.index("clean_address") if "clean_address" in header else 3
+        num_idx = header.index("address_numbers") if "address_numbers" in header else 4
+        ctry_idx = header.index("country") if "country" in header else 6
+        
+        for line in f:
+            parts = line.rstrip("\r\n").split("\t")
+            eid = parts[id_idx]
+            if active_ids is None or eid in active_ids:
+                name = parts[name_idx] if name_idx < len(parts) else ""
+                addr = parts[addr_idx] if addr_idx < len(parts) else ""
+                nums = parts[num_idx] if num_idx < len(parts) else ""
+                ctry = parts[ctry_idx] if ctry_idx < len(parts) else ""
+                meta[eid] = (name, addr, nums, ctry.lower())
+    return meta
+
+
 def run_hybrid_prediction_pipeline(
     candidate_file: str = None,
     output_file: str = None,
@@ -97,7 +124,9 @@ def run_hybrid_prediction_pipeline(
     if output_file is None:
         output_file = os.path.join(OUT_DIR, "matching_results_hybrid.tsv")
     if model_file is None:
-        model_file = os.path.join(MODEL_DIR, "lgb_matcher.joblib")
+        hybrid_path = os.path.join(MODEL_DIR, "lgb_hybrid_matcher.joblib")
+        std_path = os.path.join(MODEL_DIR, "lgb_matcher.joblib")
+        model_file = hybrid_path if os.path.isfile(hybrid_path) else std_path
         
     # Check embedding files
     s1_mmap_path = os.path.join(EMBED_DIR, "s1_embeddings.mmap")
@@ -123,70 +152,43 @@ def run_hybrid_prediction_pipeline(
     print(f"  Model Type: LightGBM (GBDT)")
     print(f"  Optimal Decision Threshold: {optimal_threshold:.2f}")
     
-    # Load Embeddings Memmaps if available
-    s1_vecs, s1_id_map = None, {}
-    tgt_vecs, tgt_id_map = None, {}
+    # 1. Load S1 Strings and Index Mapping
+    print("\n[1/3] Loading Normalized Test S1 Dataset...")
+    t_s1 = time.time()
+    s1_path = os.path.join(NORM_DIR, "test_source1_normalized.tsv")
+    s1_meta = load_normalized_tsv_records(s1_path)
+    s1_id_map = {eid: idx for idx, eid in enumerate(s1_meta.keys())}
+    print(f"  Loaded {len(s1_meta):,} S1 query entities in {time.time()-t_s1:.2f}s.")
     
+    # 2. Load Embeddings Mapping & Target Strings
+    s1_vecs, tgt_vecs, tgt_id_map = None, None, {}
     if has_embeddings:
-        print("Loading disk memmaps for S1 and Target vectors...")
-        with open(s1_map_path, "r", encoding="utf-8") as f:
-            s1_id_map = json.load(f)
+        print("\n[2/3] Loading target embedding ID map...")
+        t_map = time.time()
         with open(tgt_map_path, "r", encoding="utf-8") as f:
             tgt_id_map = json.load(f)
-            
+        print(f"  Loaded {len(tgt_id_map):,} target ID mappings in {time.time()-t_map:.2f}s.")
+        
         dim = 384
         s1_vecs = np.memmap(s1_mmap_path, dtype=np.float16, mode="r", shape=(len(s1_id_map), dim))
         tgt_vecs = np.memmap(tgt_mmap_path, dtype=np.float16, mode="r", shape=(len(tgt_id_map), dim))
         print("  Memmaps loaded into virtual address space successfully.")
-
-    # Collect Active Candidate IDs
-    print(f"\nPass 1: Scanning {os.path.basename(candidate_file)} for active candidate targets...")
-    t_scan = time.time()
-    active_target_ids = set()
-    with open(candidate_file, "r", encoding="utf-8") as f:
-        next(f, None)
-        for line in f:
-            parts = line.rstrip("\r\n").split("\t")
-            if len(parts) > 1 and parts[1].strip():
-                for cid in parts[1].split(","):
-                    cid = cid.strip()
-                    if cid:
-                        active_target_ids.add(cid)
-                        
-    print(f"  Found {len(active_target_ids):,} active candidate targets in {time.time()-t_scan:.2f}s!")
     
-    # Load S1 Strings
-    print("\nLoading Normalized Test S1 Dataset...")
-    s1_path = os.path.join(NORM_DIR, "test_source1_normalized.tsv")
-    df_s1 = pd.read_csv(s1_path, sep="\t", dtype=str, keep_default_na=False)
-    
-    s1_names = dict(zip(df_s1["entity_id"], df_s1["clean_name"].fillna("")))
-    s1_addrs = dict(zip(df_s1["entity_id"], df_s1["clean_address"].fillna("")))
-    s1_nums = dict(zip(df_s1["entity_id"], df_s1["address_numbers"].fillna("")))
-    s1_countries = dict(zip(df_s1["entity_id"], df_s1["country"].fillna("")))
-    del df_s1
-    gc.collect()
-    
-    # Load Target Strings
-    print(f"Loading metadata for {len(active_target_ids):,} active targets from S2 and S3...")
-    tgt_names, tgt_addrs, tgt_nums, tgt_countries = {}, {}, {}, {}
+    # 3. Load Target Metadata for Active Target IDs
+    print(f"\n[3/3] Loading metadata for {len(tgt_id_map):,} active targets from S2 and S3...")
+    t_tgt = time.time()
+    tgt_meta = {}
     s2_path = os.path.join(NORM_DIR, "test_source2_normalized.tsv")
     s3_path = os.path.join(NORM_DIR, "test_source3_normalized.tsv")
     
     for path in [s2_path, s3_path]:
-        df_t = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-        df_active = df_t[df_t["entity_id"].isin(active_target_ids)]
-        for _, row in df_active.iterrows():
-            eid = row["entity_id"]
-            tgt_names[eid] = row.get("clean_name", "")
-            tgt_addrs[eid] = row.get("clean_address", "")
-            tgt_nums[eid] = row.get("address_numbers", "")
-            tgt_countries[eid] = row.get("country", "")
-        del df_t, df_active
+        print(f"  Filtering {os.path.basename(path)}...")
+        meta = load_normalized_tsv_records(path, tgt_id_map)
+        tgt_meta.update(meta)
+        del meta
         gc.collect()
         
-    del active_target_ids
-    gc.collect()
+    print(f"  Loaded {len(tgt_meta):,} active target records in {time.time()-t_tgt:.2f}s!")
     
     # Chunked Scoring
     print(f"\nProcessing candidate pairs in chunks of {batch_size:,} S1 entities...")
@@ -196,8 +198,8 @@ def run_hybrid_prediction_pipeline(
     total_pairs_scored = 0
     total_pairs_matched = 0
     
-    with open(output_file, "w", encoding="utf-8") as f_out, \
-         open(candidate_file, "r", encoding="utf-8") as f_cand:
+    with open(output_file, "w", encoding="utf-8", newline="\n") as f_out, \
+         open(candidate_file, "r", encoding="utf-8", newline="") as f_cand:
         
         next(f_cand, None)
         f_out.write("source1_entity_id\tmatched_entity_ids\n")
@@ -212,8 +214,7 @@ def run_hybrid_prediction_pipeline(
             if len(chunk_lines) >= batch_size:
                 s1_cnt, match_cnt, sing_cnt, scored_cnt, m_pair_cnt = _score_and_write_hybrid_chunk(
                     chunk_lines, model, optimal_threshold,
-                    s1_names, s1_addrs, s1_nums, s1_countries,
-                    tgt_names, tgt_addrs, tgt_nums, tgt_countries,
+                    s1_meta, tgt_meta,
                     s1_vecs, s1_id_map, tgt_vecs, tgt_id_map,
                     f_out
                 )
@@ -229,8 +230,7 @@ def run_hybrid_prediction_pipeline(
         if chunk_lines:
             s1_cnt, match_cnt, sing_cnt, scored_cnt, m_pair_cnt = _score_and_write_hybrid_chunk(
                 chunk_lines, model, optimal_threshold,
-                s1_names, s1_addrs, s1_nums, s1_countries,
-                tgt_names, tgt_addrs, tgt_nums, tgt_countries,
+                s1_meta, tgt_meta,
                 s1_vecs, s1_id_map, tgt_vecs, tgt_id_map,
                 f_out
             )
@@ -252,19 +252,41 @@ def run_hybrid_prediction_pipeline(
     print(f"  Total Confirmed Match Pairs: {total_pairs_matched:,}")
     print(f"  Output Saved to: {output_file}")
     print("=" * 80)
+    
+    # Run Submission Validator
+    val_script = os.path.join(BASE_DIR, "utils", "validate_submission.py")
+    if os.path.isfile(val_script):
+        print("\n" + "=" * 80)
+        print("RUNNING SUBMISSION VALIDATOR (validate_submission.py)")
+        print("=" * 80)
+        raw_test_dir = os.path.join(BASE_DIR, "dataset", "test")
+        cmd = [
+            sys.executable,
+            val_script,
+            "--matching", output_file,
+            "--candidate", candidate_file,
+            "--test-dir", raw_test_dir
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        print(res.stdout)
+        if res.stderr:
+            print("Stderr:", res.stderr)
+        if res.returncode == 0:
+            print(">>> VALIDATOR STATUS: PASS (Exit Code 0) <<<")
 
 
 def _score_and_write_hybrid_chunk(
     chunk_lines: list,
     model,
     threshold: float,
-    s1_names: dict, s1_addrs: dict, s1_nums: dict, s1_countries: dict,
-    tgt_names: dict, tgt_addrs: dict, tgt_nums: dict, tgt_countries: dict,
+    s1_meta: dict,
+    tgt_meta: dict,
     s1_vecs, s1_id_map: dict, tgt_vecs, tgt_id_map: dict,
     f_out
 ):
-    pairs_to_score = []
-    pair_meta = []
+    # 1. Parse lines
+    parsed = []
+    needed_tids = set()
     s1_items = []
     
     for line in chunk_lines:
@@ -272,44 +294,57 @@ def _score_and_write_hybrid_chunk(
         s1_id = parts[0]
         cand_str = parts[1] if len(parts) > 1 else ""
         cands = [c.strip() for c in cand_str.split(",") if c.strip()]
-        
         s1_idx = len(s1_items)
         s1_items.append(s1_id)
-        
-        if not cands:
-            continue
+        if cands:
+            parsed.append((s1_idx, s1_id, cands))
+            needed_tids.update(cands)
             
-        n1 = s1_names.get(s1_id, "")
-        a1 = s1_addrs.get(s1_id, "")
-        num1 = s1_nums.get(s1_id, "")
-        c1 = str(s1_countries.get(s1_id, "")).lower()
-        
-        # S1 embedding vector lookup
+    # 2. Batch-prefetch target vectors in sequential disk order (Ultra fast!)
+    tgt_vec_cache = {}
+    if tgt_vecs is not None and tgt_id_map:
+        valid_tids = [tid for tid in needed_tids if tid in tgt_id_map]
+        if valid_tids:
+            indices = [tgt_id_map[tid] for tid in valid_tids]
+            order = np.argsort(indices)
+            sorted_indices = [indices[o] for o in order]
+            sorted_tids = [valid_tids[o] for o in order]
+            
+            # Slice in sequential disk order
+            batch_vecs = np.array(tgt_vecs[sorted_indices], dtype=np.float32)
+            for tid, v in zip(sorted_tids, batch_vecs):
+                tgt_vec_cache[tid] = v
+                del v
+            del batch_vecs, sorted_indices, sorted_tids, order, valid_tids
+            
+    # 3. Extract features
+    pairs_to_score = []
+    pair_meta = []
+    empty_tuple = ("", "", "", "")
+    n_features_model = getattr(model, "n_features_in_", 11)
+    
+    for s1_idx, s1_id, cands in parsed:
+        n1, a1, num1, c1 = s1_meta.get(s1_id, empty_tuple)
         s1_v = None
         if s1_vecs is not None and s1_id in s1_id_map:
             s1_v = np.array(s1_vecs[s1_id_map[s1_id]], dtype=np.float32)
             
         for tgt_id in cands:
-            n2 = tgt_names.get(tgt_id, "")
-            a2 = tgt_addrs.get(tgt_id, "")
-            num2 = tgt_nums.get(tgt_id, "")
-            c2 = str(tgt_countries.get(tgt_id, "")).lower()
+            n2, a2, num2, c2 = tgt_meta.get(tgt_id, empty_tuple)
             
-            # Dot-product cosine similarity
             cosine_sim = 0.0
-            if s1_v is not None and tgt_vecs is not None and tgt_id in tgt_id_map:
-                tgt_v = np.array(tgt_vecs[tgt_id_map[tgt_id]], dtype=np.float32)
-                cosine_sim = float(np.dot(s1_v, tgt_v))
+            if s1_v is not None and tgt_id in tgt_vec_cache:
+                cosine_sim = float(np.dot(s1_v, tgt_vec_cache[tgt_id]))
                 
             feats = extract_pair_features(n1, n2, a1, a2, num1, num2, c1, c2, cosine_sim)
-            # If model was trained on 10 features, slice first 10, else use all 11
-            n_features_model = getattr(model, "n_features_in_", 10)
             if n_features_model == 10:
                 feats = feats[:10]
                 
             pairs_to_score.append(feats)
             pair_meta.append((s1_idx, tgt_id))
             
+    del tgt_vec_cache, parsed, needed_tids
+    
     scored_cnt = len(pairs_to_score)
     s1_matches = defaultdict(list)
     match_pair_cnt = 0
